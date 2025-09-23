@@ -1,4 +1,4 @@
-# <center> 4DGC: Rate-Aware 4D Gaussian Compression for Efficient Streamable Free-Viewpoint Video </center>
+# <center> 4DGC: Rate-Aware 4D Gaussian Compression for Efficient Streamable Free-Viewpoint Video [CVPR 2025]</center>
 
 <p>
 <div style="text-align: center;">
