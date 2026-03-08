@@ -15,6 +15,14 @@ from datetime import datetime
 import numpy as np
 import random
 
+if hasattr(torch, "compile"):
+    _maybe_compile = torch.compile
+else:
+    def _maybe_compile(*args, **kwargs):
+        def _decorator(fn):
+            return fn
+        return _decorator
+
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
@@ -138,7 +146,7 @@ def safe_state(silent):
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
 
-@torch.compile()
+@_maybe_compile()
 def quaternion_multiply(a, b):
     """
     Multiply two sets of quaternions.

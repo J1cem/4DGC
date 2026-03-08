@@ -109,7 +109,7 @@ class OptimizationParams(ParamGroup):
         self.std_scale=1
         # self.min_opacity = 0.002
         self.min_opacity = 0.005
-        self.lambda_rd_base = 0
+        self.lambda_rd_base = 0.0
         self.rotate_sh = False
         self.only_mlp = False
         super().__init__(parser, "Optimization Parameters")

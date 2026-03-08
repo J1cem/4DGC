@@ -1,7 +1,9 @@
 import sys
-import os
-project_directory = '..'
-sys.path.append(os.path.abspath(project_directory))
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
 
 import torch
 import numpy as np
@@ -12,6 +14,12 @@ from tqdm import tqdm
 from mem import Motion_Estimation_Module
 from scene.Motion_Grid import Motion_Grid
 from argparse import ArgumentParser, Namespace
+
+if hasattr(torch, "compile"):
+    _maybe_compile = torch.compile
+else:
+    def _maybe_compile(fn):
+        return fn
 
 def fetchXYZ(path):
     plydata = PlyData.read(path)
@@ -31,7 +39,7 @@ def get_contracted_xyz(xyz):
     normalzied_xyz=(xyz-xyz_bound_min)/(xyz_bound_max-xyz_bound_min)
     return normalzied_xyz
 
-@torch.compile
+@_maybe_compile
 def quaternion_multiply(a, b):
     a_norm=nn.functional.normalize(a)
     b_norm=nn.functional.normalize(b)
@@ -101,4 +109,3 @@ if __name__ == '__main__':
     mem=Motion_Estimation_Module(model,get_xyz_bound(xyz)[0],get_xyz_bound(xyz)[1])
     torch.save(mem.state_dict(),args.output_path)
     print('Done')
-

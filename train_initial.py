@@ -29,6 +29,7 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+_TB_HIST_DISABLED = False
 
 class rdloss(torch.nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
@@ -134,6 +135,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+            if (iteration in checkpoint_iterations):
+                ckpt_path = os.path.join(scene.output_path, f"chkpnt{iteration}.pth")
+                print(f"\n[ITER {iteration}] Saving Checkpoint: {ckpt_path}")
+                torch.save((gaussians.capture(), iteration), ckpt_path)
+            if iteration % 100 == 0 or iteration == opt.iterations:
+                torch.save((gaussians.capture(), iteration), os.path.join(scene.output_path, "chkpnt_latest.pth"))
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -209,8 +216,14 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
+        global _TB_HIST_DISABLED
         if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            if not _TB_HIST_DISABLED:
+                try:
+                    tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+                except Exception as e:
+                    _TB_HIST_DISABLED = True
+                    print(f"[WARN] Disable TensorBoard histogram due to compatibility issue: {e}")
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
     scene.gaussians.is_train = True

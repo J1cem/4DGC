@@ -2,3 +2,8 @@ outputs/
 test/coffee_martini
 submodules/
 mem/*.pth
+.venv/
+.venv310/
+__pycache__/
+submodules/
+dataset/

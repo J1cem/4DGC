@@ -34,6 +34,7 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+_TB_HIST_DISABLED = False
 
 class rdloss(torch.nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
@@ -311,8 +312,14 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     last_gt = gt_image
                     last_test_ssim = ssim_test
 
+        global _TB_HIST_DISABLED
         if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            if not _TB_HIST_DISABLED:
+                try:
+                    tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+                except Exception as e:
+                    _TB_HIST_DISABLED = True
+                    print(f"[WARN] Disable TensorBoard histogram due to compatibility issue: {e}")
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
         
