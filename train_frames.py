@@ -74,6 +74,12 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
     gaussians = GaussianModel(dataset.sh_degree, q = dataset.q)
     scene = Scene(dataset, gaussians, load_iteration=load_iteration, shuffle=False)
+
+    # ===== 新增 Anchor 初始化 =====
+    gaussians.init_anchor(num_anchor=1024)
+    gaussians.assign_anchor_by_xyz()
+
+
     gaussians.training_one_frame_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -210,7 +216,10 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
             # reshape 为 entropy model 需要的格式
             attributes = residual.view(
-                (residual.shape[0], residual.shape[1], 3, 1)
+                residual.shape[0],
+                residual.shape[1],
+                3,
+                1
             ).permute(3,1,2,0)
 
             # entropy coding residual
@@ -245,6 +254,10 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
                              
             if (iteration - opt.iterations) % opt.densification_interval == 0:
                 gaussians.adding_and_prune(opt,scene.cameras_extent)
+
+                # ===== 新增：重新分配 anchor =====
+                gaussians.assign_anchor_by_xyz()
+
             # Optimizer step
             if iteration <= opt.iterations + opt.iterations_s2:
                 gaussians.optimizer.step()
