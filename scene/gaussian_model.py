@@ -1340,3 +1340,9 @@ class GaussianModel_base:
         anchor_feat = self.anchor_features[self.anchor_ids]
         residual = features - anchor_feat
         return residual
+
+
+    def reconstruct_feature(self, residual):
+        anchor_feat = self.anchor_features[self.anchor_ids]
+        feature = anchor_feat + residual
+        return feature
