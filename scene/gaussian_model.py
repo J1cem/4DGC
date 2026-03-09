@@ -881,6 +881,62 @@ class GaussianModel:
         return feature
 
 
+    def minibatch_kmeans_anchor(
+            self,
+            num_anchor=1024,
+            batch_size=8192,
+            num_iters=500,
+            lr=0.5
+        ):
+        """
+        MiniBatch K-means for Gaussian feature anchors
+        """
+        f_dc = self._added_features_dc.contiguous()
+        f_rest = self._added_features_rest.contiguous()
+        features = torch.cat((f_dc, f_rest), dim=1)
+        device = features.device
+        N, Fdim = features.shape
+    
+        # 初始化 anchor
+        rand_idx = torch.randperm(N)[:num_anchor]
+        anchors = features[rand_idx].clone()
+        counts = torch.zeros(num_anchor, device=device)
+
+        for i in range(num_iters):
+
+            # 随机采样 batch
+            idx = torch.randint(0, N, (batch_size,), device=device)
+            batch = features[idx]
+
+            # 距离
+            dist = torch.cdist(batch, anchors)
+
+            # 最近 anchor
+            nearest = torch.argmin(dist, dim=1)
+
+            for j in range(batch_size):
+
+                k = nearest[j]
+
+                counts[k] += 1
+
+                eta = lr / counts[k]
+
+                anchors[k] = (1 - eta) * anchors[k] + eta * batch[j]
+
+            if i % 50 == 0:
+                print(f"KMeans iter {i}/{num_iters}")
+
+        # 最终分配 anchor id
+        dist_full = torch.cdist(features, anchors)
+        anchor_ids = torch.argmin(dist_full, dim=1)
+
+        self.anchor_features = torch.nn.Parameter(anchors)
+        self.anchor_ids = anchor_ids
+
+        return anchor_ids
+
+
 class GaussianModel_base:
 
     def setup_functions(self):
