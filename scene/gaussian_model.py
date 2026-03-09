@@ -1316,3 +1316,27 @@ class GaussianModel_base:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    
+    def init_anchor(self, num_anchor=1024):
+        """
+        初始化 anchor feature
+        """
+        feat_dim = self._features_dc.shape[1] + self._features_rest.shape[1]
+         self.anchor_features = torch.nn.Parameter(
+            torch.zeros(num_anchor, feat_dim).cuda()
+        )
+         # 每个 Gaussian 对应一个 anchor
+        self.anchor_ids = torch.randint(
+            0, num_anchor, (self.get_xyz.shape[0],), device="cuda"
+        )
+
+
+    def compute_anchor_residual(self):
+
+        f_dc = self._added_features_dc
+        f_rest = self._added_features_rest
+        features = torch.cat((f_dc, f_rest), dim=1)
+        anchor_feat = self.anchor_features[self.anchor_ids]
+        residual = features - anchor_feat
+        return residual
