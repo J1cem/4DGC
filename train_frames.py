@@ -194,13 +194,32 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             # Loss
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
+
             loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+            # 读取 Gaussian feature
             f_dc = gaussians._added_features_dc.contiguous()
             f_rest = gaussians._added_features_rest.contiguous()
-            attributes = torch.cat((f_dc, f_rest), dim=1).view((f_dc.shape[0],f_dc.shape[1]+f_rest.shape[1],3,1)).permute(3,1,2,0)
-            y_hat, y_likelihoods = gaussians.entropy_bottleneck_added(attributes) 
-            codec_loss = criterion(y_hat,y_likelihoods, attributes)['loss'] 
-            loss += opt.lambda_rd_base * codec_loss 
+
+            features = torch.cat((f_dc, f_rest), dim=1)
+
+            # ===== Anchor residual =====
+            anchor_feat = gaussians.anchor_features[gaussians.anchor_ids]
+
+            residual = features - anchor_feat
+
+            # reshape 为 entropy model 需要的格式
+            attributes = residual.view(
+                (residual.shape[0], residual.shape[1], 3, 1)
+            ).permute(3,1,2,0)
+
+            # entropy coding residual
+            y_hat, y_likelihoods = gaussians.entropy_bottleneck_added(attributes)
+
+            # RD loss
+            codec_loss = criterion(y_hat, y_likelihoods, attributes)['loss']
+
+            loss += opt.lambda_rd_base * codec_loss
             
         loss/=opt.batch_size
         loss.backward()
