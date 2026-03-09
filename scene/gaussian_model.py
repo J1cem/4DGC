@@ -832,6 +832,55 @@ class GaussianModel:
             self._new_rot = self.rotation_compose(self._rotation, self._d_rot)
 
 
+    def assign_anchor_by_xyz(self, grid_size=0.1):
+        """
+        根据Gaussian的空间位置分配anchor
+        """
+        xyz = self.get_xyz.detach()
+        # 计算空间grid
+        grid = torch.floor(xyz / grid_size).long()
+        # 将3D grid映射成1D id
+        anchor_ids = (
+            grid[:, 0] * 73856093 +
+            grid[:, 1] * 19349663 +
+            grid[:, 2] * 83492791
+        )
+    # 归一化到 anchor 数量范围
+        num_anchor = self.anchor_features.shape[0]
+        anchor_ids = torch.abs(anchor_ids) % num_anchor
+        self.anchor_ids = anchor_ids
+        return anchor_ids
+
+    def init_anchor(self, num_anchor=1024):
+        """
+        初始化 anchor feature
+        """
+        feat_dim = self._features_dc.shape[1] + self._features_rest.shape[1]
+         self.anchor_features = torch.nn.Parameter(
+            torch.zeros(num_anchor, feat_dim).cuda()
+        )
+         # 每个 Gaussian 对应一个 anchor
+        self.anchor_ids = torch.randint(
+            0, num_anchor, (self.get_xyz.shape[0],), device="cuda"
+        )
+
+
+    def compute_anchor_residual(self):
+
+        f_dc = self._added_features_dc
+        f_rest = self._added_features_rest
+        features = torch.cat((f_dc, f_rest), dim=1)
+        anchor_feat = self.anchor_features[self.anchor_ids]
+        residual = features - anchor_feat
+        return residual
+
+
+    def reconstruct_feature(self, residual):
+        anchor_feat = self.anchor_features[self.anchor_ids]
+        feature = anchor_feat + residual
+        return feature
+
+
 class GaussianModel_base:
 
     def setup_functions(self):
