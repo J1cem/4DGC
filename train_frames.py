@@ -52,7 +52,7 @@ class rdloss(torch.nn.Module):
         num_pixels = N * H * W
 
         out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            (torch.log(likelihoods.clamp_min(1e-9)).sum() / (-math.log(2) * num_pixels))
             for likelihoods in y_likelihoods
         )
         out["mse_loss"] = self.metric(y_hat, target)
@@ -250,7 +250,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             scale_reg = gaussians.get_scaling[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
 
             loss += opt.lambda_rd_base * codec_loss
-            loss += 0.1 * appearance_recon_loss
+            loss += 0.01 * appearance_recon_loss
             loss += opt.lambda_opacity_sparse * opacity_sparse
             loss += opt.lambda_scale_reg * scale_reg
             
