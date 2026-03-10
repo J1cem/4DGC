@@ -12,10 +12,10 @@
 import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from scene.gaussian_model import GaussianModel
+from typing import Any
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc: Any, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None):
     """
     Render the scene. 
     
@@ -53,7 +53,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
+
+    decoded = None
+    if hasattr(pc, "get_decoded_appearance"):
+        decoded = pc.get_decoded_appearance(viewpoint_camera.camera_center)
+
+    opacity = decoded["opacity"] if decoded is not None else pc.get_opacity
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -61,17 +66,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        if decoded is not None:
+            cov3D_precomp = pc.covariance_activation(decoded["scale"], scaling_modifier, decoded["rotation"])
+        else:
+            cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
+        scales = decoded["scale"] if decoded is not None else pc.get_scaling
+        rotations = decoded["rotation"] if decoded is not None else pc.get_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
     colors_precomp = None
     if colors_precomp is None:
-        if pipe.convert_SHs_python:
+        if decoded is not None:
+            colors_precomp = decoded["color"]
+        elif pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
