@@ -15,14 +15,14 @@ import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel, GaussianModel_base
-from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 import re
+from typing import Any
 class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args: Any, gaussians: GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
         """
         :param path: Path to colmap scene main folder.
         """
@@ -118,7 +118,7 @@ class Scene_base:
 
     gaussians : GaussianModel_base
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel_base, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args: Any, gaussians: GaussianModel_base, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
         """b
         :param path: Path to colmap scene main folder.
         """
