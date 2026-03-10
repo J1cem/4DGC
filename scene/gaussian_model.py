@@ -27,6 +27,33 @@ import torch.optim.lr_scheduler as lr_scheduler
 import torch.nn.functional as F
 from scene.entropy_models import EntropyBottleneck
 
+
+class AnchorAppearanceMLP(nn.Module):
+    """Decode per-Gaussian appearance from anchor feature + view condition."""
+
+    def __init__(self, feature_dim, hidden_dim=128):
+        super().__init__()
+        in_dim = feature_dim + 4  # view_dir(3) + view_dist(1)
+        self.backbone = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.color_head = nn.Linear(hidden_dim, 3)
+        self.opacity_head = nn.Linear(hidden_dim, 1)
+        self.rotation_head = nn.Linear(hidden_dim, 4)
+        self.scale_head = nn.Linear(hidden_dim, 3)
+
+    def forward(self, anchor_feature, view_dir, view_dist):
+        x = torch.cat((anchor_feature, view_dir, view_dist), dim=-1)
+        h = self.backbone(x)
+        color = torch.sigmoid(self.color_head(h))
+        opacity = torch.sigmoid(self.opacity_head(h))
+        rotation = F.normalize(self.rotation_head(h), dim=-1)
+        scale = F.softplus(self.scale_head(h)) + 1e-6
+        return color, opacity, rotation, scale
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -83,6 +110,11 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+
+        self.anchor_features = None
+        self.anchor_ids = None
+        self.appearance_decoder = None
+
         self.setup_functions()
 
     def capture(self):
@@ -779,6 +811,13 @@ class GaussianModel:
         self.entropy_bottleneck_added = EntropyBottleneck(channels=(1+self.max_sh_degree)**2,entropy_coder='rangecoder').to('cuda')
         for param in self.entropy_bottleneck_added.parameters():
             l.append({'params': [param], 'lr': 1e-3,  "name": "entropy_model"})
+
+        if self.anchor_features is not None:
+            l.append({'params': [self.anchor_features], 'lr': training_args.feature_lr, "name": "anchor_features"})
+            self._ensure_anchor_decoder()
+            for param in self.appearance_decoder.parameters():
+                l.append({'params': [param], 'lr': training_args.feature_lr, "name": "appearance_decoder"})
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -861,11 +900,45 @@ class GaussianModel:
             self._new_rot = self.rotation_compose(self._rotation, self._d_rot)
 
 
+    def _flatten_anchor_feature(self, anchor_feat):
+        return anchor_feat.reshape(anchor_feat.shape[0], -1)
+
+    def _ensure_anchor_decoder(self):
+        if self.anchor_features is None:
+            raise RuntimeError("anchor_features is not initialized, call init_anchor first")
+        feature_dim = self.anchor_features.shape[1] * self.anchor_features.shape[2]
+        if self.appearance_decoder is None:
+            self.appearance_decoder = AnchorAppearanceMLP(feature_dim).to(self.anchor_features.device)
+
+    def get_decoded_appearance(self, camera_center):
+        if self.anchor_features is None or self.anchor_ids is None:
+            return None
+
+        self._ensure_anchor_decoder()
+        xyz = self.get_xyz
+        anchor_feat = self.anchor_features[self.anchor_ids]
+        anchor_feat = self._flatten_anchor_feature(anchor_feat)
+
+        cam_center = camera_center.unsqueeze(0).expand(xyz.shape[0], -1)
+        cam_to_point = xyz - cam_center
+        view_dist = cam_to_point.norm(dim=-1, keepdim=True)
+        view_dir = cam_to_point / torch.clamp_min(view_dist, 1e-6)
+
+        color, opacity, rotation, scale = self.appearance_decoder(anchor_feat, view_dir, view_dist)
+        return {
+            "color": color,
+            "opacity": opacity,
+            "rotation": rotation,
+            "scale": scale
+        }
+
+
+
     def assign_anchor_by_xyz(self, grid_size=0.1):
         """
         根据Gaussian的空间位置分配anchor
         """
-        xyz = self._added_xyz.detach() if self._added_xyz is not None else self.get_xyz.detach()
+        xyz = self.get_xyz.detach()
         # 计算空间grid
         grid = torch.floor(xyz / grid_size).long()
         # 将3D grid映射成1D id
@@ -889,6 +962,7 @@ class GaussianModel:
         self.anchor_features = torch.nn.Parameter(
             torch.zeros(num_anchor, feat_dim, feat_channel).cuda()
         )
+        self.appearance_decoder = None
         # 每个 Gaussian 对应一个 anchor
         target_xyz = self._added_xyz if self._added_xyz is not None else self.get_xyz
         self.anchor_ids = torch.randint(
