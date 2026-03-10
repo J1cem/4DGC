@@ -107,9 +107,13 @@ class OptimizationParams(ParamGroup):
         self.num_of_split=1
         self.num_of_spawn=2
         self.std_scale=1
+        self.max_added_ratio = 0.6
         # self.min_opacity = 0.002
-        self.min_opacity = 0.005
-        self.lambda_rd_base = 0.0
+        self.min_opacity = 0.008
+        self.lambda_rd_base = 0.01
+        self.lambda_opacity_sparse = 0.0005
+        self.lambda_scale_reg = 0.001
+        self.max_added_scale = 0.06
         self.rotate_sh = False
         self.only_mlp = False
         super().__init__(parser, "Optimization Parameters")

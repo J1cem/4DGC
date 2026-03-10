@@ -229,7 +229,13 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             # RD loss
             codec_loss = criterion(y_hat, y_likelihoods, attributes)['loss']
 
+            # regularization for artifact reduction and compactness
+            opacity_sparse = gaussians.get_opacity[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
+            scale_reg = gaussians.get_scaling[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
+
             loss += opt.lambda_rd_base * codec_loss
+            loss += opt.lambda_opacity_sparse * opacity_sparse
+            loss += opt.lambda_scale_reg * scale_reg
             
         loss/=opt.batch_size
         loss.backward()

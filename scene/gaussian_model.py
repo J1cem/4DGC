@@ -644,6 +644,7 @@ class GaussianModel:
             self.adding_and_split(grads, training_args.densify_grad_threshold, training_args.std_scale, training_args.num_of_split)
         if self._added_xyz.shape[0]>0:
             self.prune_added_points(training_args.min_opacity, extent)
+            self.limit_added_points(training_args.max_added_ratio)
         torch.cuda.empty_cache()
 
     def prune_added_points(self, min_opacity, extent):
@@ -670,6 +671,30 @@ class GaussianModel:
         self._added_mask=added_mask
         torch.cuda.empty_cache()
         
+    def limit_added_points(self, max_added_ratio):
+        if self._added_xyz is None or self._added_xyz.shape[0] == 0:
+            return
+        max_added = int(self._xyz.shape[0] * max_added_ratio)
+        if max_added <= 0 or self._added_xyz.shape[0] <= max_added:
+            return
+
+        added_opacity = self.get_opacity[-self._added_xyz.shape[0]:].squeeze()
+        keep_idx = torch.topk(added_opacity, k=max_added, largest=True).indices
+        valid_points_mask = torch.zeros_like(added_opacity, dtype=torch.bool)
+        valid_points_mask[keep_idx] = True
+
+        optimizable_tensors = self._prune_optimizer(valid_points_mask)
+        self._added_xyz = optimizable_tensors["added_xyz"]
+        self._added_features_dc = optimizable_tensors["added_f_dc"]
+        self._added_features_rest = optimizable_tensors["added_f_rest"]
+        self._added_opacity = optimizable_tensors["added_opacity"]
+        self._added_scaling = optimizable_tensors["added_scaling"]
+        self._added_rotation = optimizable_tensors["added_rotation"]
+
+        added_mask=torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
+        added_mask[-self._added_xyz.shape[0]:]=True
+        self._added_mask=added_mask
+
     def training_one_frame_s2_setup(self, training_args):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -691,6 +716,8 @@ class GaussianModel:
         added_rotation_spawn = torch.tensor([1.,0.,0.,0.],device='cuda').repeat(N*num_of_spawn, 1).detach().requires_grad_(True)
         added_opacity_spawn = self.inverse_opacity_activation(torch.tensor([0.1],device='cuda')).repeat(N*num_of_spawn, 1).detach().requires_grad_(True)
         added_scaling_spawn = (self.scaling_inverse_activation(self.get_scaling[selected_pts_mask_spawn].repeat(num_of_spawn,1) / (0.8*num_of_spawn))).detach().requires_grad_(True)
+        if training_args.max_added_scale > 0:
+            added_scaling_spawn = torch.clamp(added_scaling_spawn, max=np.log(training_args.max_added_scale)).detach().requires_grad_(True)
         added_features_dc_spawn = (self.get_features[:,0:1,:][selected_pts_mask_spawn].repeat(num_of_spawn,1,1)).detach().requires_grad_(True)
         added_features_rest_spawn = (self.get_features[:,1:,:][selected_pts_mask_spawn].repeat(num_of_spawn,1,1)).detach().requires_grad_(True)
 
@@ -708,6 +735,8 @@ class GaussianModel:
         added_features_rest_clone = self.get_features[:, 1:, :][selected_pts_mask_clone].clone().detach().requires_grad_(True)
         added_opacity_clone = (self._opacity[selected_pts_mask_clone]/10).clone().detach().requires_grad_(True)
         added_scaling_clone = (self._scaling[selected_pts_mask_clone] - 2).clone().detach().requires_grad_(True)
+        if training_args.max_added_scale > 0:
+            added_scaling_clone = torch.clamp(added_scaling_clone, max=np.log(training_args.max_added_scale)).detach().requires_grad_(True)
         added_rotation_clone = self.get_rotation[selected_pts_mask_clone].clone().detach().requires_grad_(True)
 
         # Combine spawned and cloned Gaussians
