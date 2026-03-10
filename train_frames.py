@@ -178,6 +178,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
     if(opt.iterations_s2>0):
     # Prune, Clone and setting up  
         gaussians.training_one_frame_s2_setup(opt)
+        gaussians.assign_anchor_by_xyz()
         progress_bar = tqdm(range(opt.iterations, opt.iterations + opt.iterations_s2), desc="Training progress of Stage 2")    
         criterion = rdloss(lmbda=0.01)
     # Train the new Gaussians

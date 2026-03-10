@@ -836,7 +836,7 @@ class GaussianModel:
         """
         根据Gaussian的空间位置分配anchor
         """
-        xyz = self.get_xyz.detach()
+        xyz = self._added_xyz.detach() if self._added_xyz is not None else self.get_xyz.detach()
         # 计算空间grid
         grid = torch.floor(xyz / grid_size).long()
         # 将3D grid映射成1D id
@@ -856,12 +856,14 @@ class GaussianModel:
         初始化 anchor feature
         """
         feat_dim = self._features_dc.shape[1] + self._features_rest.shape[1]
-         self.anchor_features = torch.nn.Parameter(
-            torch.zeros(num_anchor, feat_dim).cuda()
+        feat_channel = self._features_dc.shape[2]
+        self.anchor_features = torch.nn.Parameter(
+            torch.zeros(num_anchor, feat_dim, feat_channel).cuda()
         )
-         # 每个 Gaussian 对应一个 anchor
+        # 每个 Gaussian 对应一个 anchor
+        target_xyz = self._added_xyz if self._added_xyz is not None else self.get_xyz
         self.anchor_ids = torch.randint(
-            0, num_anchor, (self.get_xyz.shape[0],), device="cuda"
+            0, num_anchor, (target_xyz.shape[0],), device="cuda"
         )
 
 
@@ -870,6 +872,10 @@ class GaussianModel:
         f_dc = self._added_features_dc
         f_rest = self._added_features_rest
         features = torch.cat((f_dc, f_rest), dim=1)
+
+        if self.anchor_ids.shape[0] != features.shape[0]:
+            self.assign_anchor_by_xyz()
+
         anchor_feat = self.anchor_features[self.anchor_ids]
         residual = features - anchor_feat
         return residual
@@ -1428,10 +1434,11 @@ class GaussianModel_base:
         初始化 anchor feature
         """
         feat_dim = self._features_dc.shape[1] + self._features_rest.shape[1]
-         self.anchor_features = torch.nn.Parameter(
-            torch.zeros(num_anchor, feat_dim).cuda()
+        feat_channel = self._features_dc.shape[2]
+        self.anchor_features = torch.nn.Parameter(
+            torch.zeros(num_anchor, feat_dim, feat_channel).cuda()
         )
-         # 每个 Gaussian 对应一个 anchor
+        # 每个 Gaussian 对应一个 anchor
         self.anchor_ids = torch.randint(
             0, num_anchor, (self.get_xyz.shape[0],), device="cuda"
         )
