@@ -204,36 +204,53 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
             loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
-            # 读取 Gaussian feature
-            f_dc = gaussians._added_features_dc.contiguous()
-            f_rest = gaussians._added_features_rest.contiguous()
+            # ===== 由 Anchor + 视角信息解码外观属性 =====
+            decoded = gaussians.get_decoded_appearance(viewpoint_cam.camera_center)
+            num_added = gaussians._added_xyz.shape[0]
 
-            features = torch.cat((f_dc, f_rest), dim=1)
+            if num_added > 0 and decoded is not None:
+                added_slice = slice(-num_added, None)
 
-            # ===== Anchor residual =====
-            anchor_feat = gaussians.anchor_features[gaussians.anchor_ids]
+                target_opacity = gaussians.get_opacity[added_slice]
+                target_scale = gaussians.get_scaling[added_slice]
+                target_rotation = gaussians.get_rotation[added_slice]
 
-            residual = features - anchor_feat
+                pred_opacity = decoded["opacity"][added_slice]
+                pred_scale = decoded["scale"][added_slice]
+                pred_rotation = decoded["rotation"][added_slice]
 
-            # reshape 为 entropy model 需要的格式
-            attributes = residual.view(
-                residual.shape[0],
-                residual.shape[1],
-                3,
-                1
-            ).permute(3,1,2,0)
+                appearance_recon_loss = (
+                    torch.nn.functional.l1_loss(pred_opacity, target_opacity)
+                    + torch.nn.functional.l1_loss(pred_scale, target_scale)
+                    + quaternion_loss(pred_rotation, target_rotation)
+                )
 
-            # entropy coding residual
-            y_hat, y_likelihoods = gaussians.entropy_bottleneck_added(attributes)
+                # 仅编码 anchor residual，减少逐点属性存储需求
+                f_dc = gaussians._added_features_dc.contiguous()
+                f_rest = gaussians._added_features_rest.contiguous()
+                features = torch.cat((f_dc, f_rest), dim=1)
+                anchor_feat = gaussians.anchor_features[gaussians.anchor_ids[added_slice]]
+                residual = features - anchor_feat
 
-            # RD loss
-            codec_loss = criterion(y_hat, y_likelihoods, attributes)['loss']
+                attributes = residual.view(
+                    residual.shape[0],
+                    residual.shape[1],
+                    3,
+                    1
+                ).permute(3,1,2,0)
+
+                y_hat, y_likelihoods = gaussians.entropy_bottleneck_added(attributes)
+                codec_loss = criterion(y_hat, y_likelihoods, attributes)['loss']
+            else:
+                appearance_recon_loss = torch.tensor(0.0, device=loss.device)
+                codec_loss = torch.tensor(0.0, device=loss.device)
 
             # regularization for artifact reduction and compactness
             opacity_sparse = gaussians.get_opacity[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
             scale_reg = gaussians.get_scaling[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
 
             loss += opt.lambda_rd_base * codec_loss
+            loss += 0.1 * appearance_recon_loss
             loss += opt.lambda_opacity_sparse * opacity_sparse
             loss += opt.lambda_scale_reg * scale_reg
             
