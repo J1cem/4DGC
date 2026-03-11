@@ -77,6 +77,7 @@ class GaussianModel:
         self._added_mask = None
         self._transient_remaining_life = None
         self._transient_event_score = None
+        self._transient_candidate_mask = None
         self._ema_region_error = None
         
         self.max_radii2D = torch.empty(0)
@@ -876,11 +877,13 @@ class GaussianModel:
         if self._added_xyz is None or self._added_xyz.shape[0] == 0:
             self._transient_remaining_life = torch.empty(0, device="cuda", dtype=torch.int32)
             self._transient_event_score = torch.empty(0, device="cuda")
+            self._transient_candidate_mask = torch.empty(0, device="cuda", dtype=torch.bool)
             self._ema_region_error = {}
             return
         n_added = self._added_xyz.shape[0]
         self._transient_remaining_life = torch.zeros((n_added,), device="cuda", dtype=torch.int32)
         self._transient_event_score = torch.zeros((n_added,), device="cuda")
+        self._transient_candidate_mask = torch.zeros((n_added,), device="cuda", dtype=torch.bool)
         self._ema_region_error = {}
 
     def update_transient_mutation_state(self, render_error, spike_factor=2.5, lifetime=12, grid_size=0.2):
@@ -908,6 +911,7 @@ class GaussianModel:
             if ratio > spike_factor:
                 self._transient_remaining_life[mask] = int(lifetime)
                 self._transient_event_score[mask] = ratio
+                self._transient_candidate_mask[mask] = True
             self._ema_region_error[key] = 0.95 * prev + 0.05 * cur_err
 
         self._transient_remaining_life = torch.clamp(self._transient_remaining_life - 1, min=0)
@@ -945,7 +949,10 @@ class GaussianModel:
             return
         if self._transient_remaining_life is None or self._transient_remaining_life.numel() == 0:
             return
-        valid_points_mask = self._transient_remaining_life > 0
+        valid_points_mask = torch.logical_or(
+            ~self._transient_candidate_mask,
+            self._transient_remaining_life > 0,
+        )
         if valid_points_mask.all():
             return
 
@@ -958,6 +965,7 @@ class GaussianModel:
         self._added_rotation = optimizable_tensors["added_rotation"]
         self._transient_remaining_life = self._transient_remaining_life[valid_points_mask]
         self._transient_event_score = self._transient_event_score[valid_points_mask]
+        self._transient_candidate_mask = self._transient_candidate_mask[valid_points_mask]
 
         added_mask = torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
         if self._added_xyz.shape[0] > 0:
