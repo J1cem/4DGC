@@ -10,6 +10,7 @@
 #
 import time
 import os
+import csv
 import torch
 import pickle
 from random import randint
@@ -397,6 +398,9 @@ def train_one_frame(lp,op,pp,args):
         print(f"Preparation: {pre_time}")
         print(f"Stage 1: {s1_time}")
         print(f"Stage 2: {s2_time}")
+        res_dict['preparation_time'] = pre_time
+        res_dict['stage1/time'] = s1_time
+        res_dict['stage2/time'] = s2_time
         if s1_ress !=[]:
             for idx, s1_res in enumerate(s1_ress):
                 save_tensor_img(s1_res['last_test_image'],os.path.join(args.output_path,f'{idx}_rendering1'))
@@ -404,14 +408,12 @@ def train_one_frame(lp,op,pp,args):
                 print(f"Stage1/psnr_{idx}: {s1_res['last_test_psnr']}")
                 res_dict[f'stage1/points_num_{idx}']=s1_res['last_points_num']
                 res_dict[f'stage1/ssim_{idx}']=s1_res['last_test_ssim']
-            res_dict[f'stage1/time']=s1_time
         if s2_ress !=[]:
             for idx, s2_res in enumerate(s2_ress):
                 save_tensor_img(s2_res['last_test_image'],os.path.join(args.output_path,f'{idx}_rendering2'))
                 res_dict[f'stage2/psnr_{idx}']=s2_res['last_test_psnr']
                 res_dict[f'stage2/points_num_{idx}']=s2_res['last_points_num']
                 res_dict[f'stage2/ssim_{idx}']=s2_res['last_test_ssim']
-            res_dict[f'stage2/time']=s2_time
     return res_dict 
 
 def train_frames(lp, op, pp, args):
@@ -434,6 +436,7 @@ def train_frames(lp, op, pp, args):
     result2_psnr = []
     result1_ssim = []
     result2_ssim = []
+    csv_rows = []
     for frame in frames:
         start_time = time.time()
         args.source_path = os.path.join(video_path, frame)
@@ -442,20 +445,68 @@ def train_frames(lp, op, pp, args):
         
         res_dict = train_one_frame(lp,op,pp,args)
 
-        result1_psnr.append(res_dict[f'stage1/psnr_0'])
-        result2_psnr.append(res_dict[f'stage2/psnr_0'])
-        result1_ssim.append(res_dict[f'stage1/ssim_0'])
-        result2_ssim.append(res_dict[f'stage2/ssim_0'])
+        stage1_psnr = float(res_dict.get('stage1/psnr_0', 0.0))
+        stage2_psnr = float(res_dict.get('stage2/psnr_0', stage1_psnr))
+        stage1_ssim = float(res_dict.get('stage1/ssim_0', 0.0))
+        stage2_ssim = float(res_dict.get('stage2/ssim_0', stage1_ssim))
+
+        result1_psnr.append(stage1_psnr)
+        result2_psnr.append(stage2_psnr)
+        result1_ssim.append(stage1_ssim)
+        result2_ssim.append(stage2_ssim)
+
+        frame_time = time.time()-start_time
+        csv_rows.append({
+            'frame': frame,
+            'preparation_time': float(res_dict.get('preparation_time', 0.0)),
+            'stage1_time': float(res_dict.get('stage1/time', 0.0)),
+            'stage2_time': float(res_dict.get('stage2/time', 0.0)),
+            'stage1_psnr_0': stage1_psnr,
+            'stage1_ssim_0': stage1_ssim,
+            'stage1_points_num_0': int(res_dict.get('stage1/points_num_0', 0)),
+            'stage2_psnr_0': stage2_psnr,
+            'stage2_ssim_0': stage2_ssim,
+            'stage2_points_num_0': int(res_dict.get('stage2/points_num_0', 0)),
+            'avg_stage1_psnr': float(sum(result1_psnr)/len(result1_psnr)),
+            'avg_stage1_ssim': float(sum(result1_ssim)/len(result1_ssim)),
+            'avg_stage2_psnr': float(sum(result2_psnr)/len(result2_psnr)),
+            'avg_stage2_ssim': float(sum(result2_ssim)/len(result2_ssim)),
+            'frame_total_time': float(frame_time),
+        })
 
         output_str = "avg: stage{} PSNR {} SSIM {}".format(1,sum(result1_psnr)/len(result1_psnr),sum(result1_ssim)/len(result1_ssim))
         print(output_str)
         output_str = "avg: stage{} PSNR {} SSIM {}".format(2,sum(result2_psnr)/len(result2_psnr),sum(result2_ssim)/len(result2_ssim))
         print(output_str)
 
-        print(f"Frame {frame} finished in {time.time()-start_time} seconds.")
+        print(f"Frame {frame} finished in {frame_time} seconds.")
         model_path = args.output_path
         args.load_iteration = load_iteration
         torch.cuda.empty_cache()
+
+    csv_path = os.path.join(output_path, "frame_metrics.csv")
+    fieldnames = [
+        'frame',
+        'preparation_time',
+        'stage1_time',
+        'stage2_time',
+        'stage1_psnr_0',
+        'stage1_ssim_0',
+        'stage1_points_num_0',
+        'stage2_psnr_0',
+        'stage2_ssim_0',
+        'stage2_points_num_0',
+        'avg_stage1_psnr',
+        'avg_stage1_ssim',
+        'avg_stage2_psnr',
+        'avg_stage2_ssim',
+        'frame_total_time',
+    ]
+    with open(csv_path, 'w', newline='') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+    print(f"Saved frame metrics csv to: {csv_path}")
 
 
         
