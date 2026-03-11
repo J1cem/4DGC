@@ -918,12 +918,66 @@ class GaussianModel:
         self._new_xyz = None
         self._new_rot = None
         
-    def compress_sh_attributes(self, soft_threshold=0.0, added_only=True, opacity_aware=True, opacity_alpha=1.5, preserve_ratio=0.0):
+    def compress_sh_attributes(self, soft_threshold=0.0, added_only=True, opacity_aware=True, opacity_alpha=1.5,
+                               preserve_ratio=0.0, low_opacity_only=True, opacity_cutoff=0.25,
+                               relative_threshold_cap=0.15, sparsity_ratio=0.35, quant_step=0.0005):
         if soft_threshold <= 0:
             return
 
         def _soft_shrink(x, threshold):
             return torch.sign(x) * torch.relu(torch.abs(x) - threshold)
+
+        def _build_threshold(sh_tensor, opacity_tensor):
+            threshold = torch.full(
+                (sh_tensor.shape[0], 1, 1),
+                float(soft_threshold),
+                device=sh_tensor.device,
+                dtype=sh_tensor.dtype,
+            )
+            if opacity_aware and opacity_tensor is not None:
+                threshold = threshold * (1.0 + opacity_alpha * (1.0 - opacity_tensor.unsqueeze(1)))
+            if low_opacity_only and opacity_tensor is not None:
+                threshold = threshold * (opacity_tensor.unsqueeze(1) <= opacity_cutoff).to(sh_tensor.dtype)
+            if relative_threshold_cap > 0:
+                sh_scale = sh_tensor.abs().mean(dim=(1, 2), keepdim=True)
+                threshold = torch.minimum(threshold, sh_scale * relative_threshold_cap)
+            return threshold
+
+        def _sparsify_and_quantize(sh_tensor, original_tensor, opacity_tensor, preserve_mask):
+            if sparsity_ratio <= 0 and quant_step <= 0:
+                return sh_tensor
+
+            n_points, n_coeff, n_ch = sh_tensor.shape
+            work_mask = torch.ones((n_points,), device=sh_tensor.device, dtype=torch.bool)
+            if low_opacity_only and opacity_tensor is not None:
+                work_mask = opacity_tensor.squeeze(-1) <= opacity_cutoff
+            if preserve_mask is not None:
+                work_mask = torch.logical_and(work_mask, ~preserve_mask)
+            if not torch.any(work_mask):
+                return sh_tensor
+
+            compressed = sh_tensor.clone()
+            compressed_rows = compressed[work_mask]
+            flat = compressed_rows.reshape(compressed_rows.shape[0], -1)
+
+            if sparsity_ratio > 0:
+                total_dim = flat.shape[1]
+                keep_dim = int(max(1, round(total_dim * (1.0 - float(sparsity_ratio)))))
+                keep_dim = min(keep_dim, total_dim)
+                topk_idx = torch.topk(flat.abs(), k=keep_dim, dim=1, largest=True).indices
+                keep_mask = torch.zeros_like(flat, dtype=torch.bool)
+                keep_mask.scatter_(1, topk_idx, True)
+                flat = torch.where(keep_mask, flat, torch.zeros_like(flat))
+
+            if quant_step > 0:
+                q = float(quant_step)
+                flat = torch.round(flat / q) * q
+
+            compressed_rows = flat.view(-1, n_coeff, n_ch)
+            compressed[work_mask] = compressed_rows
+            if preserve_mask is not None:
+                compressed[preserve_mask] = original_tensor[preserve_mask]
+            return compressed
 
         with torch.no_grad():
             if self._added_features_rest is not None and self._added_features_rest.numel() > 0:
@@ -931,30 +985,22 @@ class GaussianModel:
                 added_opacity = None
                 if self._added_opacity is not None and self._added_opacity.numel() > 0:
                     added_opacity = self.opacity_activation(self._added_opacity.data).clamp(0.0, 1.0)
-                if opacity_aware and added_opacity is not None:
-                    per_point_threshold = soft_threshold * (1.0 + opacity_alpha * (1.0 - added_opacity))
-                    shrunk = _soft_shrink(added_sh, per_point_threshold.unsqueeze(1))
-                else:
-                    shrunk = _soft_shrink(added_sh, soft_threshold)
+                threshold = _build_threshold(added_sh, added_opacity)
+                shrunk = _soft_shrink(added_sh, threshold)
                 preserve_mask = self._compute_sh_preserve_mask(added_opacity, preserve_ratio)
-                if preserve_mask is not None:
-                    shrunk[preserve_mask] = added_sh[preserve_mask]
-                self._added_features_rest.data.copy_(shrunk)
+                compressed = _sparsify_and_quantize(shrunk, added_sh, added_opacity, preserve_mask)
+                self._added_features_rest.data.copy_(compressed)
 
             if (not added_only) and self._features_rest is not None and self._features_rest.numel() > 0:
                 base_sh = self._features_rest.data
                 base_opacity = None
                 if self._opacity is not None and self._opacity.numel() > 0:
                     base_opacity = self.opacity_activation(self._opacity.data).clamp(0.0, 1.0)
-                if opacity_aware and base_opacity is not None:
-                    per_point_threshold = soft_threshold * (1.0 + opacity_alpha * (1.0 - base_opacity))
-                    shrunk = _soft_shrink(base_sh, per_point_threshold.unsqueeze(1))
-                else:
-                    shrunk = _soft_shrink(base_sh, soft_threshold)
+                threshold = _build_threshold(base_sh, base_opacity)
+                shrunk = _soft_shrink(base_sh, threshold)
                 preserve_mask = self._compute_sh_preserve_mask(base_opacity, preserve_ratio)
-                if preserve_mask is not None:
-                    shrunk[preserve_mask] = base_sh[preserve_mask]
-                self._features_rest.data.copy_(shrunk)
+                compressed = _sparsify_and_quantize(shrunk, base_sh, base_opacity, preserve_mask)
+                self._features_rest.data.copy_(compressed)
 
     def get_contracted_xyz(self):
         with torch.no_grad():

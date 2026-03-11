@@ -299,6 +299,11 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
                         opacity_aware=bool(opt.sh_compress_opacity_aware),
                         opacity_alpha=opt.sh_compress_opacity_alpha,
                         preserve_ratio=opt.sh_preserve_ratio,
+                        low_opacity_only=bool(opt.sh_compress_low_opacity_only),
+                        opacity_cutoff=opt.sh_compress_opacity_cutoff,
+                        relative_threshold_cap=opt.sh_threshold_relative_cap,
+                        sparsity_ratio=opt.sh_sparsity_ratio,
+                        quant_step=opt.sh_quant_step,
                     )
                 gaussians.optimizer.zero_grad(set_to_none = True)
 

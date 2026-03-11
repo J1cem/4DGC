@@ -125,6 +125,11 @@ class OptimizationParams(ParamGroup):
         self.sh_compress_opacity_aware = 1
         self.sh_compress_opacity_alpha = 1.5
         self.sh_preserve_ratio = 0.15
+        self.sh_compress_low_opacity_only = 1
+        self.sh_compress_opacity_cutoff = 0.25
+        self.sh_threshold_relative_cap = 0.15
+        self.sh_sparsity_ratio = 0.35
+        self.sh_quant_step = 0.0005
         self.s2_min_add_candidates = 128
         self.rotate_sh = False
         self.only_mlp = False
