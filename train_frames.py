@@ -203,8 +203,8 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
 
-            per_point_error = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
-            per_point_error[visibility_filter] = radii[visibility_filter].detach()
+            per_point_error = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda", dtype=torch.float32)
+            per_point_error[visibility_filter] = radii[visibility_filter].detach().to(per_point_error.dtype)
             gaussians.update_transient_mutation_state(
                 per_point_error,
                 spike_factor=opt.mutation_spike_factor,
