@@ -274,7 +274,11 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
                 scene.save(iteration=iteration, save_type='all')
                              
             if (iteration - opt.iterations) % opt.densification_interval == 0:
-                gaussians.adding_and_prune(opt,scene.cameras_extent)
+                gaussians.adding_and_prune(
+                    opt,
+                    scene.cameras_extent,
+                    force_add=((iteration - opt.iterations) <= opt.densification_interval),
+                )
 
                 # ===== 新增：重新分配 anchor =====
                 gaussians.assign_anchor_by_xyz()
@@ -294,6 +298,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
                         added_only=bool(opt.sh_compress_added_only),
                         opacity_aware=bool(opt.sh_compress_opacity_aware),
                         opacity_alpha=opt.sh_compress_opacity_alpha,
+                        preserve_ratio=opt.sh_preserve_ratio,
                     )
                 gaussians.optimizer.zero_grad(set_to_none = True)
 

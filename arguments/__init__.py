@@ -103,7 +103,7 @@ class OptimizationParams(ParamGroup):
         self.scale_threshold = -1
         self.mem_path = ""
         self.batch_size = 1
-        self.s2_adding = False
+        self.s2_adding = True
         self.num_of_split=1
         self.num_of_spawn=2
         self.std_scale=1
@@ -124,6 +124,8 @@ class OptimizationParams(ParamGroup):
         self.sh_compress_warmup = 200
         self.sh_compress_opacity_aware = 1
         self.sh_compress_opacity_alpha = 1.5
+        self.sh_preserve_ratio = 0.15
+        self.s2_min_add_candidates = 128
         self.rotate_sh = False
         self.only_mlp = False
         super().__init__(parser, "Optimization Parameters")
