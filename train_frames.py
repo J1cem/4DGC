@@ -178,8 +178,10 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
     if(opt.iterations_s2>0):
     # Prune, Clone and setting up  
         gaussians.training_one_frame_s2_setup(opt)
+        print(f"[Stage2] Initialized added Gaussians: {gaussians._added_xyz.shape[0]}")
         gaussians.assign_anchor_by_xyz()
         gaussians.limit_added_points(opt.max_added_ratio * opt.compression_ratio_s2)
+        print(f"[Stage2] Added Gaussians after limit: {gaussians._added_xyz.shape[0]}")
         progress_bar = tqdm(range(opt.iterations, opt.iterations + opt.iterations_s2), desc="Training progress of Stage 2")    
         criterion = rdloss(lmbda=0.01)
     # Train the new Gaussians
@@ -203,8 +205,8 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
 
-            per_point_error = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
-            per_point_error[visibility_filter] = radii[visibility_filter].detach()
+            per_point_error = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda", dtype=torch.float32)
+            per_point_error[visibility_filter] = radii[visibility_filter].detach().to(per_point_error.dtype)
             gaussians.update_transient_mutation_state(
                 per_point_error,
                 spike_factor=opt.mutation_spike_factor,

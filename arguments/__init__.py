@@ -114,7 +114,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_rd_base = 0.01
         self.lambda_opacity_sparse = 0.0005
         self.lambda_scale_reg = 0.001
-        self.lambda_group_se3 = 0.0005
+        self.lambda_group_se3 = 0.0001
         self.mutation_spike_factor = 2.5
         self.transient_lifetime = 12
         self.max_added_scale = 0.06
