@@ -79,6 +79,7 @@ class GaussianModel:
         self._transient_event_score = None
         self._transient_candidate_mask = None
         self._ema_region_error = None
+        self._prev_added_xyz = None
         
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -603,7 +604,20 @@ class GaussianModel:
         added_mask=torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
         added_mask[-self._added_xyz.shape[0]:]=True
         self._added_mask=added_mask
+        self._prev_added_xyz = None
         self._reset_transient_tracking()
+
+    def _sync_added_tracking_by_mask(self, valid_points_mask):
+        if self._transient_remaining_life is not None and self._transient_remaining_life.numel() > 0:
+            self._transient_remaining_life = self._transient_remaining_life[valid_points_mask]
+            self._transient_event_score = self._transient_event_score[valid_points_mask]
+            self._transient_candidate_mask = self._transient_candidate_mask[valid_points_mask]
+
+        if self.anchor_ids is not None and self.anchor_ids.numel() == valid_points_mask.numel():
+            self.anchor_ids = self.anchor_ids[valid_points_mask]
+
+        if self._prev_added_xyz is not None and self._prev_added_xyz.shape[0] == valid_points_mask.numel():
+            self._prev_added_xyz = self._prev_added_xyz[valid_points_mask]
         
     def adding_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
@@ -674,9 +688,7 @@ class GaussianModel:
         added_mask=torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
         added_mask[-self._added_xyz.shape[0]:]=True
         self._added_mask=added_mask
-        if self._transient_remaining_life is not None and self._transient_remaining_life.numel() > 0:
-            self._transient_remaining_life = self._transient_remaining_life[valid_points_mask]
-            self._transient_event_score = self._transient_event_score[valid_points_mask]
+        self._sync_added_tracking_by_mask(valid_points_mask)
         torch.cuda.empty_cache()
         
     def limit_added_points(self, max_added_ratio):
@@ -702,9 +714,7 @@ class GaussianModel:
         added_mask=torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
         added_mask[-self._added_xyz.shape[0]:]=True
         self._added_mask=added_mask
-        if self._transient_remaining_life is not None and self._transient_remaining_life.numel() > 0:
-            self._transient_remaining_life = self._transient_remaining_life[valid_points_mask]
-            self._transient_event_score = self._transient_event_score[valid_points_mask]
+        self._sync_added_tracking_by_mask(valid_points_mask)
 
     def training_one_frame_s2_setup(self, training_args):
         grads = self.xyz_gradient_accum / self.denom
@@ -921,34 +931,45 @@ class GaussianModel:
             return torch.tensor(0.0, device="cuda")
 
         added_xyz = self._added_xyz
-        group_ids = self.anchor_ids[-added_xyz.shape[0]:]
+        if self._prev_added_xyz is None or self._prev_added_xyz.shape[0] != added_xyz.shape[0]:
+            self._prev_added_xyz = added_xyz.detach().clone()
+            return torch.tensor(0.0, device=added_xyz.device)
+
+        if self.anchor_ids is None or self.anchor_ids.numel() != added_xyz.shape[0]:
+            self.assign_anchor_by_xyz()
+
+        group_ids = self.anchor_ids
         unique_gid = torch.unique(group_ids)
         reg = torch.tensor(0.0, device=added_xyz.device)
+        displacement = added_xyz - self._prev_added_xyz
+        valid_group = 0
 
         for gid in unique_gid:
             mask = group_ids == gid
             if mask.sum() < 3:
                 continue
-            pts = added_xyz[mask]
-            center = pts.mean(dim=0, keepdim=True)
-            centered = pts - center
-            cov = centered.transpose(0, 1) @ centered / max(int(mask.sum().item()) - 1, 1)
-            _, eigvec = torch.linalg.eigh(cov)
-            R = eigvec
-            if torch.det(R) < 0:
-                R = R.clone()
-                R[:, 0] = -R[:, 0]
-            t = center.squeeze(0)
-            rigid_pts = centered @ R + t
-            reg = reg + (pts - rigid_pts).pow(2).mean()
-            self._added_xyz.data[mask] = rigid_pts.detach()
-        return reg / max(unique_gid.shape[0], 1)
+            gid_disp = displacement[mask]
+            reg = reg + (gid_disp - gid_disp.mean(dim=0, keepdim=True)).pow(2).mean()
+            valid_group += 1
+
+        self._prev_added_xyz = added_xyz.detach().clone()
+        return reg / max(valid_group, 1)
 
     def prune_transient_points(self):
         if self._added_xyz is None or self._added_xyz.shape[0] == 0:
             return
         if self._transient_remaining_life is None or self._transient_remaining_life.numel() == 0:
             return
+        if (
+            self._transient_remaining_life.numel() != self._added_xyz.shape[0]
+            or self._transient_candidate_mask is None
+            or self._transient_candidate_mask.numel() != self._added_xyz.shape[0]
+            or self._transient_event_score is None
+            or self._transient_event_score.numel() != self._added_xyz.shape[0]
+        ):
+            self._reset_transient_tracking()
+            return
+
         valid_points_mask = torch.logical_or(
             ~self._transient_candidate_mask,
             self._transient_remaining_life > 0,
@@ -963,9 +984,7 @@ class GaussianModel:
         self._added_opacity = optimizable_tensors["added_opacity"]
         self._added_scaling = optimizable_tensors["added_scaling"]
         self._added_rotation = optimizable_tensors["added_rotation"]
-        self._transient_remaining_life = self._transient_remaining_life[valid_points_mask]
-        self._transient_event_score = self._transient_event_score[valid_points_mask]
-        self._transient_candidate_mask = self._transient_candidate_mask[valid_points_mask]
+        self._sync_added_tracking_by_mask(valid_points_mask)
 
         added_mask = torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
         if self._added_xyz.shape[0] > 0:
