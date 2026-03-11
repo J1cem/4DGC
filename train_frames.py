@@ -274,7 +274,11 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
                 scene.save(iteration=iteration, save_type='all')
                              
             if (iteration - opt.iterations) % opt.densification_interval == 0:
-                gaussians.adding_and_prune(opt,scene.cameras_extent)
+                gaussians.adding_and_prune(
+                    opt,
+                    scene.cameras_extent,
+                    force_add=((iteration - opt.iterations) <= opt.densification_interval),
+                )
 
                 # ===== 新增：重新分配 anchor =====
                 gaussians.assign_anchor_by_xyz()
@@ -283,6 +287,24 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             # Optimizer step
             if iteration <= opt.iterations + opt.iterations_s2:
                 gaussians.optimizer.step()
+                stage2_it = iteration - opt.iterations
+                if (
+                    opt.sh_soft_threshold > 0
+                    and stage2_it >= max(0, opt.sh_compress_warmup)
+                    and (stage2_it % max(1, opt.sh_compress_interval) == 0)
+                ):
+                    gaussians.compress_sh_attributes(
+                        soft_threshold=opt.sh_soft_threshold,
+                        added_only=bool(opt.sh_compress_added_only),
+                        opacity_aware=bool(opt.sh_compress_opacity_aware),
+                        opacity_alpha=opt.sh_compress_opacity_alpha,
+                        preserve_ratio=opt.sh_preserve_ratio,
+                        low_opacity_only=bool(opt.sh_compress_low_opacity_only),
+                        opacity_cutoff=opt.sh_compress_opacity_cutoff,
+                        relative_threshold_cap=opt.sh_threshold_relative_cap,
+                        sparsity_ratio=opt.sh_sparsity_ratio,
+                        quant_step=opt.sh_quant_step,
+                    )
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
     s2_end_time=time.time()
