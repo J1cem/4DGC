@@ -634,7 +634,7 @@ class GaussianModel:
 
         self.adding_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def adding_and_split(self, grads, grad_threshold, std_scale, num_of_split=1):
+    def adding_and_split(self, grads, grad_threshold, std_scale, num_of_split=1, max_added_scale=-1):
         # Extract points that satisfy the gradient condition
         contracted_xyz=self.get_contracted_xyz()                          
         mask = (contracted_xyz >= 0) & (contracted_xyz <= 1)
@@ -648,7 +648,12 @@ class GaussianModel:
         rots = build_rotation(self.get_rotation[selected_pts_mask]).repeat(num_of_split,1,1)
         
         added_xyz = (torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(num_of_split, 1)).detach().requires_grad_(True)
-        added_scaling = (self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(num_of_split,1) / (0.8*num_of_split))).detach().requires_grad_(True)
+        added_scaling = self.scaling_inverse_activation(
+            self.get_scaling[selected_pts_mask].repeat(num_of_split,1) / (0.8*num_of_split)
+        )
+        if max_added_scale > 0:
+            added_scaling = torch.clamp(added_scaling, max=np.log(max_added_scale))
+        added_scaling = added_scaling.detach().requires_grad_(True)
         added_rotation = (self.get_rotation[selected_pts_mask].repeat(num_of_split,1)).detach().requires_grad_(True)
         added_features_dc = (self.get_features[:,0:1,:][selected_pts_mask].repeat(num_of_split,1,1)).detach().requires_grad_(True)
         added_features_rest = (self.get_features[:,1:,:][selected_pts_mask].repeat(num_of_split,1,1)).detach().requires_grad_(True)
@@ -656,20 +661,52 @@ class GaussianModel:
 
         self.adding_postfix(added_xyz, added_features_dc, added_features_rest, added_opacity, added_scaling, added_rotation)
 
-    def adding_and_prune(self, training_args, extent):
+    def adding_and_prune(self, training_args, extent, force_add=False):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
-        if training_args.s2_adding:
-            self.adding_and_split(grads, training_args.densify_grad_threshold, training_args.std_scale, training_args.num_of_split)
+        should_add = bool(training_args.s2_adding or force_add)
+        if should_add:
+            add_before = self._added_xyz.shape[0] if self._added_xyz is not None else 0
+            self.adding_and_split(
+                grads,
+                training_args.densify_grad_threshold,
+                training_args.std_scale,
+                training_args.num_of_split,
+                training_args.max_added_scale,
+            )
+            add_after = self._added_xyz.shape[0] if self._added_xyz is not None else 0
+            min_candidates = max(0, int(getattr(training_args, "s2_min_add_candidates", 0)))
+            if add_after <= add_before and min_candidates > 0:
+                grad_norm = torch.norm(grads, dim=-1)
+                contracted_xyz = self.get_contracted_xyz()
+                valid_mask = ((contracted_xyz >= 0) & (contracted_xyz <= 1)).all(dim=1)
+                valid_idx = torch.where(valid_mask)[0]
+                if valid_idx.numel() > 0:
+                    k = min(min_candidates, int(valid_idx.numel()))
+                    top_local_idx = torch.topk(grad_norm[valid_idx], k=k, largest=True).indices
+                    force_mask = torch.zeros_like(valid_mask)
+                    force_mask[valid_idx[top_local_idx]] = True
+                    force_grads = torch.zeros_like(grads)
+                    force_grads[force_mask] = training_args.densify_grad_threshold + 1.0
+                    self.adding_and_split(
+                        force_grads,
+                        training_args.densify_grad_threshold,
+                        training_args.std_scale,
+                        training_args.num_of_split,
+                        training_args.max_added_scale,
+                    )
         if self._added_xyz.shape[0]>0:
-            self.prune_added_points(training_args.min_opacity, extent)
+            self.prune_added_points(training_args.min_opacity, extent, training_args.max_added_scale)
             self.limit_added_points(training_args.max_added_ratio)
         torch.cuda.empty_cache()
 
-    def prune_added_points(self, min_opacity, extent):
+    def prune_added_points(self, min_opacity, extent, max_added_scale=-1):
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
         prune_mask = torch.logical_or(prune_mask, big_points_ws)[-self._added_xyz.shape[0]:]
+        if max_added_scale > 0:
+            over_scale_mask = self.get_scaling[-self._added_xyz.shape[0]:].max(dim=1).values > max_added_scale
+            prune_mask = torch.logical_or(prune_mask, over_scale_mask)
         valid_points_mask = ~prune_mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -829,8 +866,49 @@ class GaussianModel:
 
         self.denom[update_filter] += 1
 
+    def _sanitize_mem_displacement(self, d_xyz):
+        if d_xyz is None or d_xyz.numel() == 0:
+            return d_xyz
+
+        # Keep normal MEM motion untouched and only suppress extreme outliers.
+        # This avoids large black splats while preserving PSNR-sensitive motion details.
+        motion_norm = torch.norm(d_xyz, dim=1)
+        if motion_norm.numel() == 0:
+            return d_xyz
+
+        scene_min, scene_max = self.get_xyz_bound(90)
+        scene_diag = torch.norm(scene_max - scene_min).detach()
+
+        q999 = torch.quantile(motion_norm.detach(), 0.999)
+        outlier_threshold = torch.clamp(q999 * 3.0, min=scene_diag * 0.03, max=scene_diag * 0.45)
+        hard_cap = torch.clamp(q999 * 6.0, min=scene_diag * 0.06, max=scene_diag * 0.80)
+
+        outlier_mask = motion_norm > outlier_threshold
+        if not torch.any(outlier_mask):
+            return d_xyz
+
+        safe_norm = torch.clamp(motion_norm, min=1e-8)
+        scale = torch.ones_like(safe_norm)
+        scale[outlier_mask] = torch.clamp(hard_cap / safe_norm[outlier_mask], max=1.0)
+        return d_xyz * scale.unsqueeze(-1)
+
+    def _compute_sh_preserve_mask(self, opacity, preserve_ratio):
+        if opacity is None or opacity.numel() == 0:
+            return None
+        keep_ratio = float(max(0.0, min(1.0, preserve_ratio)))
+        if keep_ratio <= 0.0:
+            return None
+        n = opacity.shape[0]
+        keep_k = int(max(1, round(n * keep_ratio)))
+        keep_k = min(keep_k, n)
+        keep_idx = torch.topk(opacity.squeeze(-1), k=keep_k, largest=True).indices
+        preserve_mask = torch.zeros((n,), device=opacity.device, dtype=torch.bool)
+        preserve_mask[keep_idx] = True
+        return preserve_mask
+
     def query_mem(self):
         mask, self._d_xyz, self._d_rot = self.mem(self._xyz)
+        self._d_xyz = self._sanitize_mem_displacement(self._d_xyz)
         self._new_xyz = self._d_xyz + self._xyz
         self._new_rot = self.rotation_compose(self._rotation, self._d_rot)
 
@@ -840,6 +918,44 @@ class GaussianModel:
         self._new_xyz = None
         self._new_rot = None
         
+    def compress_sh_attributes(self, soft_threshold=0.0, added_only=True, opacity_aware=True, opacity_alpha=1.5, preserve_ratio=0.0):
+        if soft_threshold <= 0:
+            return
+
+        def _soft_shrink(x, threshold):
+            return torch.sign(x) * torch.relu(torch.abs(x) - threshold)
+
+        with torch.no_grad():
+            if self._added_features_rest is not None and self._added_features_rest.numel() > 0:
+                added_sh = self._added_features_rest.data
+                added_opacity = None
+                if self._added_opacity is not None and self._added_opacity.numel() > 0:
+                    added_opacity = self.opacity_activation(self._added_opacity.data).clamp(0.0, 1.0)
+                if opacity_aware and added_opacity is not None:
+                    per_point_threshold = soft_threshold * (1.0 + opacity_alpha * (1.0 - added_opacity))
+                    shrunk = _soft_shrink(added_sh, per_point_threshold.unsqueeze(1))
+                else:
+                    shrunk = _soft_shrink(added_sh, soft_threshold)
+                preserve_mask = self._compute_sh_preserve_mask(added_opacity, preserve_ratio)
+                if preserve_mask is not None:
+                    shrunk[preserve_mask] = added_sh[preserve_mask]
+                self._added_features_rest.data.copy_(shrunk)
+
+            if (not added_only) and self._features_rest is not None and self._features_rest.numel() > 0:
+                base_sh = self._features_rest.data
+                base_opacity = None
+                if self._opacity is not None and self._opacity.numel() > 0:
+                    base_opacity = self.opacity_activation(self._opacity.data).clamp(0.0, 1.0)
+                if opacity_aware and base_opacity is not None:
+                    per_point_threshold = soft_threshold * (1.0 + opacity_alpha * (1.0 - base_opacity))
+                    shrunk = _soft_shrink(base_sh, per_point_threshold.unsqueeze(1))
+                else:
+                    shrunk = _soft_shrink(base_sh, soft_threshold)
+                preserve_mask = self._compute_sh_preserve_mask(base_opacity, preserve_ratio)
+                if preserve_mask is not None:
+                    shrunk[preserve_mask] = base_sh[preserve_mask]
+                self._features_rest.data.copy_(shrunk)
+
     def get_contracted_xyz(self):
         with torch.no_grad():
             xyz = self.get_xyz
@@ -888,6 +1004,7 @@ class GaussianModel:
         with torch.no_grad():
             self.mem.model.is_train = False
             mask, self._d_xyz, self._d_rot = self.mem(self.get_xyz)
+            self._d_xyz = self._sanitize_mem_displacement(self._d_xyz)
             self._new_xyz = self._d_xyz + self._xyz
             self._new_rot = self.rotation_compose(self._rotation, self._d_rot)
 
