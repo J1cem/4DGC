@@ -634,7 +634,7 @@ class GaussianModel:
 
         self.adding_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def adding_and_split(self, grads, grad_threshold, std_scale, num_of_split=1):
+    def adding_and_split(self, grads, grad_threshold, std_scale, num_of_split=1, max_added_scale=-1):
         # Extract points that satisfy the gradient condition
         contracted_xyz=self.get_contracted_xyz()                          
         mask = (contracted_xyz >= 0) & (contracted_xyz <= 1)
@@ -648,7 +648,12 @@ class GaussianModel:
         rots = build_rotation(self.get_rotation[selected_pts_mask]).repeat(num_of_split,1,1)
         
         added_xyz = (torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(num_of_split, 1)).detach().requires_grad_(True)
-        added_scaling = (self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(num_of_split,1) / (0.8*num_of_split))).detach().requires_grad_(True)
+        added_scaling = self.scaling_inverse_activation(
+            self.get_scaling[selected_pts_mask].repeat(num_of_split,1) / (0.8*num_of_split)
+        )
+        if max_added_scale > 0:
+            added_scaling = torch.clamp(added_scaling, max=np.log(max_added_scale))
+        added_scaling = added_scaling.detach().requires_grad_(True)
         added_rotation = (self.get_rotation[selected_pts_mask].repeat(num_of_split,1)).detach().requires_grad_(True)
         added_features_dc = (self.get_features[:,0:1,:][selected_pts_mask].repeat(num_of_split,1,1)).detach().requires_grad_(True)
         added_features_rest = (self.get_features[:,1:,:][selected_pts_mask].repeat(num_of_split,1,1)).detach().requires_grad_(True)
@@ -660,16 +665,25 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
         if training_args.s2_adding:
-            self.adding_and_split(grads, training_args.densify_grad_threshold, training_args.std_scale, training_args.num_of_split)
+            self.adding_and_split(
+                grads,
+                training_args.densify_grad_threshold,
+                training_args.std_scale,
+                training_args.num_of_split,
+                training_args.max_added_scale,
+            )
         if self._added_xyz.shape[0]>0:
-            self.prune_added_points(training_args.min_opacity, extent)
+            self.prune_added_points(training_args.min_opacity, extent, training_args.max_added_scale)
             self.limit_added_points(training_args.max_added_ratio)
         torch.cuda.empty_cache()
 
-    def prune_added_points(self, min_opacity, extent):
+    def prune_added_points(self, min_opacity, extent, max_added_scale=-1):
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
         prune_mask = torch.logical_or(prune_mask, big_points_ws)[-self._added_xyz.shape[0]:]
+        if max_added_scale > 0:
+            over_scale_mask = self.get_scaling[-self._added_xyz.shape[0]:].max(dim=1).values > max_added_scale
+            prune_mask = torch.logical_or(prune_mask, over_scale_mask)
         valid_points_mask = ~prune_mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
