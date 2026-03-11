@@ -283,6 +283,11 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             # Optimizer step
             if iteration <= opt.iterations + opt.iterations_s2:
                 gaussians.optimizer.step()
+                if opt.sh_soft_threshold > 0 and ((iteration - opt.iterations) % max(1, opt.sh_compress_interval) == 0):
+                    gaussians.compress_sh_attributes(
+                        soft_threshold=opt.sh_soft_threshold,
+                        added_only=bool(opt.sh_compress_added_only),
+                    )
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
     s2_end_time=time.time()

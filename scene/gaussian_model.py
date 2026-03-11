@@ -847,21 +847,26 @@ class GaussianModel:
         if d_xyz is None or d_xyz.numel() == 0:
             return d_xyz
 
-        # Clamp extreme displacement outliers that can create very large dark splats.
-        # The cap is adaptive (based on motion distribution) and bounded by scene extent.
+        # Keep normal MEM motion untouched and only suppress extreme outliers.
+        # This avoids large black splats while preserving PSNR-sensitive motion details.
         motion_norm = torch.norm(d_xyz, dim=1)
         if motion_norm.numel() == 0:
             return d_xyz
 
         scene_min, scene_max = self.get_xyz_bound(90)
         scene_diag = torch.norm(scene_max - scene_min).detach()
-        adaptive_cap = torch.quantile(motion_norm.detach(), 0.995) * 2.0
-        min_cap = scene_diag * 0.01
-        max_cap = scene_diag * 0.20
-        cap = torch.clamp(adaptive_cap, min=min_cap, max=max_cap)
+
+        q999 = torch.quantile(motion_norm.detach(), 0.999)
+        outlier_threshold = torch.clamp(q999 * 3.0, min=scene_diag * 0.03, max=scene_diag * 0.45)
+        hard_cap = torch.clamp(q999 * 6.0, min=scene_diag * 0.06, max=scene_diag * 0.80)
+
+        outlier_mask = motion_norm > outlier_threshold
+        if not torch.any(outlier_mask):
+            return d_xyz
 
         safe_norm = torch.clamp(motion_norm, min=1e-8)
-        scale = torch.clamp(cap / safe_norm, max=1.0)
+        scale = torch.ones_like(safe_norm)
+        scale[outlier_mask] = torch.clamp(hard_cap / safe_norm[outlier_mask], max=1.0)
         return d_xyz * scale.unsqueeze(-1)
 
     def query_mem(self):
@@ -876,6 +881,23 @@ class GaussianModel:
         self._new_xyz = None
         self._new_rot = None
         
+    def compress_sh_attributes(self, soft_threshold=0.0, added_only=True):
+        if soft_threshold <= 0:
+            return
+
+        def _soft_shrink(x, threshold):
+            return torch.sign(x) * torch.relu(torch.abs(x) - threshold)
+
+        with torch.no_grad():
+            if self._added_features_rest is not None and self._added_features_rest.numel() > 0:
+                self._added_features_rest.data.copy_(
+                    _soft_shrink(self._added_features_rest.data, soft_threshold)
+                )
+            if (not added_only) and self._features_rest is not None and self._features_rest.numel() > 0:
+                self._features_rest.data.copy_(
+                    _soft_shrink(self._features_rest.data, soft_threshold)
+                )
+
     def get_contracted_xyz(self):
         with torch.no_grad():
             xyz = self.get_xyz
