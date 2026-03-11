@@ -179,6 +179,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
     # Prune, Clone and setting up  
         gaussians.training_one_frame_s2_setup(opt)
         gaussians.assign_anchor_by_xyz()
+        gaussians.limit_added_points(opt.max_added_ratio * opt.compression_ratio_s2)
         progress_bar = tqdm(range(opt.iterations, opt.iterations + opt.iterations_s2), desc="Training progress of Stage 2")    
         criterion = rdloss(lmbda=0.01)
     # Train the new Gaussians
@@ -201,6 +202,14 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             # Loss
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
+
+            per_point_error = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda")
+            per_point_error[visibility_filter] = radii[visibility_filter].detach().float()
+            gaussians.update_transient_mutation_state(
+                per_point_error,
+                spike_factor=opt.mutation_spike_factor,
+                lifetime=opt.transient_lifetime,
+            )
 
             loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
@@ -233,9 +242,11 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             opacity_sparse = gaussians.get_opacity[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
             scale_reg = gaussians.get_scaling[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
 
+            group_rigid_reg = gaussians.apply_group_rigid_motion()
             loss += opt.lambda_rd_base * codec_loss
             loss += opt.lambda_opacity_sparse * opacity_sparse
             loss += opt.lambda_scale_reg * scale_reg
+            loss += opt.lambda_group_se3 * group_rigid_reg
             
         loss/=opt.batch_size
         loss.backward()
@@ -264,6 +275,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
                 # ===== 新增：重新分配 anchor =====
                 gaussians.assign_anchor_by_xyz()
+                gaussians.prune_transient_points()
 
             # Optimizer step
             if iteration <= opt.iterations + opt.iterations_s2:

@@ -75,6 +75,10 @@ class GaussianModel:
         self._added_scaling = None
         self._added_rotation = None
         self._added_mask = None
+        self._transient_remaining_life = None
+        self._transient_event_score = None
+        self._ema_region_error = None
+        self._prev_added_xyz_for_group = None
         
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -599,6 +603,7 @@ class GaussianModel:
         added_mask=torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
         added_mask[-self._added_xyz.shape[0]:]=True
         self._added_mask=added_mask
+        self._reset_transient_tracking()
         
     def adding_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
@@ -669,6 +674,11 @@ class GaussianModel:
         added_mask=torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
         added_mask[-self._added_xyz.shape[0]:]=True
         self._added_mask=added_mask
+        if self._transient_remaining_life is not None and self._transient_remaining_life.numel() > 0:
+            self._transient_remaining_life = self._transient_remaining_life[valid_points_mask]
+            self._transient_event_score = self._transient_event_score[valid_points_mask]
+            if self._prev_added_xyz_for_group is not None and self._prev_added_xyz_for_group.shape[0] > 0:
+                self._prev_added_xyz_for_group = self._prev_added_xyz_for_group[valid_points_mask]
         torch.cuda.empty_cache()
         
     def limit_added_points(self, max_added_ratio):
@@ -694,6 +704,11 @@ class GaussianModel:
         added_mask=torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
         added_mask[-self._added_xyz.shape[0]:]=True
         self._added_mask=added_mask
+        if self._transient_remaining_life is not None and self._transient_remaining_life.numel() > 0:
+            self._transient_remaining_life = self._transient_remaining_life[valid_points_mask]
+            self._transient_event_score = self._transient_event_score[valid_points_mask]
+            if self._prev_added_xyz_for_group is not None and self._prev_added_xyz_for_group.shape[0] > 0:
+                self._prev_added_xyz_for_group = self._prev_added_xyz_for_group[valid_points_mask]
 
     def training_one_frame_s2_setup(self, training_args):
         grads = self.xyz_gradient_accum / self.denom
@@ -860,6 +875,105 @@ class GaussianModel:
             self._new_xyz = self._d_xyz + self._xyz
             self._new_rot = self.rotation_compose(self._rotation, self._d_rot)
 
+
+
+    def _reset_transient_tracking(self):
+        if self._added_xyz is None or self._added_xyz.shape[0] == 0:
+            self._transient_remaining_life = torch.empty(0, device="cuda", dtype=torch.int32)
+            self._transient_event_score = torch.empty(0, device="cuda")
+            self._ema_region_error = {}
+            self._prev_added_xyz_for_group = None
+            return
+        n_added = self._added_xyz.shape[0]
+        self._transient_remaining_life = torch.full((n_added,), -1, device="cuda", dtype=torch.int32)
+        self._transient_event_score = torch.zeros((n_added,), device="cuda")
+        self._ema_region_error = {}
+        self._prev_added_xyz_for_group = self._added_xyz.detach().clone()
+
+    def update_transient_mutation_state(self, render_error, spike_factor=2.5, lifetime=12, grid_size=0.2):
+        if self._added_xyz is None or self._added_xyz.shape[0] == 0:
+            return
+        n_added = self._added_xyz.shape[0]
+        if self._transient_remaining_life is None or self._transient_remaining_life.numel() != n_added:
+            self._reset_transient_tracking()
+
+        xyz_added = self._added_xyz.detach()
+        error_added = render_error[-n_added:].detach()
+        region = torch.floor(xyz_added / grid_size).long()
+        region_hash = (region[:, 0] * 73856093 + region[:, 1] * 19349663 + region[:, 2] * 83492791)
+
+        unique_region = torch.unique(region_hash)
+        for rid in unique_region:
+            mask = region_hash == rid
+            cur_err = error_added[mask].mean()
+            key = int(rid.item())
+            if key not in self._ema_region_error:
+                self._ema_region_error[key] = cur_err
+                continue
+            prev = self._ema_region_error[key]
+            ratio = (cur_err + 1e-6) / (prev + 1e-6)
+            if ratio > spike_factor:
+                self._transient_remaining_life[mask] = int(lifetime)
+                self._transient_event_score[mask] = ratio
+            self._ema_region_error[key] = 0.95 * prev + 0.05 * cur_err
+
+        transient_mask = self._transient_remaining_life > 0
+        self._transient_remaining_life[transient_mask] -= 1
+
+    def apply_group_rigid_motion(self):
+        if self._added_xyz is None or self._added_xyz.shape[0] == 0:
+            return torch.tensor(0.0, device="cuda")
+
+        added_xyz = self._added_xyz
+        if self._prev_added_xyz_for_group is None or self._prev_added_xyz_for_group.shape[0] != added_xyz.shape[0]:
+            self._prev_added_xyz_for_group = added_xyz.detach().clone()
+            return torch.tensor(0.0, device=added_xyz.device)
+
+        displacement = added_xyz - self._prev_added_xyz_for_group
+        group_ids = self.anchor_ids[-added_xyz.shape[0]:]
+        unique_gid = torch.unique(group_ids)
+        reg = torch.tensor(0.0, device=added_xyz.device)
+        valid_groups = 0
+
+        for gid in unique_gid:
+            mask = group_ids == gid
+            if mask.sum() < 2:
+                continue
+            disp = displacement[mask]
+            mean_disp = disp.mean(dim=0, keepdim=True)
+            reg = reg + (disp - mean_disp).pow(2).mean()
+            valid_groups += 1
+
+        self._prev_added_xyz_for_group = added_xyz.detach().clone()
+        if valid_groups == 0:
+            return torch.tensor(0.0, device=added_xyz.device)
+        return reg / valid_groups
+
+    def prune_transient_points(self):
+        if self._added_xyz is None or self._added_xyz.shape[0] == 0:
+            return
+        if self._transient_remaining_life is None or self._transient_remaining_life.numel() == 0:
+            return
+        valid_points_mask = (self._transient_event_score <= 0) | (self._transient_remaining_life > 0)
+        if valid_points_mask.all():
+            return
+
+        optimizable_tensors = self._prune_optimizer(valid_points_mask)
+        self._added_xyz = optimizable_tensors["added_xyz"]
+        self._added_features_dc = optimizable_tensors["added_f_dc"]
+        self._added_features_rest = optimizable_tensors["added_f_rest"]
+        self._added_opacity = optimizable_tensors["added_opacity"]
+        self._added_scaling = optimizable_tensors["added_scaling"]
+        self._added_rotation = optimizable_tensors["added_rotation"]
+        self._transient_remaining_life = self._transient_remaining_life[valid_points_mask]
+        self._transient_event_score = self._transient_event_score[valid_points_mask]
+        if self._prev_added_xyz_for_group is not None and self._prev_added_xyz_for_group.shape[0] > 0:
+            self._prev_added_xyz_for_group = self._prev_added_xyz_for_group[valid_points_mask]
+
+        added_mask = torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
+        if self._added_xyz.shape[0] > 0:
+            added_mask[-self._added_xyz.shape[0]:] = True
+        self._added_mask = added_mask
 
     def assign_anchor_by_xyz(self, grid_size=0.1):
         """
