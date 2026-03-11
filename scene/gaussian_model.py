@@ -843,8 +843,30 @@ class GaussianModel:
 
         self.denom[update_filter] += 1
 
+    def _sanitize_mem_displacement(self, d_xyz):
+        if d_xyz is None or d_xyz.numel() == 0:
+            return d_xyz
+
+        # Clamp extreme displacement outliers that can create very large dark splats.
+        # The cap is adaptive (based on motion distribution) and bounded by scene extent.
+        motion_norm = torch.norm(d_xyz, dim=1)
+        if motion_norm.numel() == 0:
+            return d_xyz
+
+        scene_min, scene_max = self.get_xyz_bound(90)
+        scene_diag = torch.norm(scene_max - scene_min).detach()
+        adaptive_cap = torch.quantile(motion_norm.detach(), 0.995) * 2.0
+        min_cap = scene_diag * 0.01
+        max_cap = scene_diag * 0.20
+        cap = torch.clamp(adaptive_cap, min=min_cap, max=max_cap)
+
+        safe_norm = torch.clamp(motion_norm, min=1e-8)
+        scale = torch.clamp(cap / safe_norm, max=1.0)
+        return d_xyz * scale.unsqueeze(-1)
+
     def query_mem(self):
         mask, self._d_xyz, self._d_rot = self.mem(self._xyz)
+        self._d_xyz = self._sanitize_mem_displacement(self._d_xyz)
         self._new_xyz = self._d_xyz + self._xyz
         self._new_rot = self.rotation_compose(self._rotation, self._d_rot)
 
@@ -902,6 +924,7 @@ class GaussianModel:
         with torch.no_grad():
             self.mem.model.is_train = False
             mask, self._d_xyz, self._d_rot = self.mem(self.get_xyz)
+            self._d_xyz = self._sanitize_mem_displacement(self._d_xyz)
             self._new_xyz = self._d_xyz + self._xyz
             self._new_rot = self.rotation_compose(self._rotation, self._d_rot)
 
