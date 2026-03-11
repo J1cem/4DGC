@@ -118,7 +118,7 @@ class OptimizationParams(ParamGroup):
         self.mutation_spike_factor = 2.5
         self.transient_lifetime = 12
         self.max_added_scale = 0.06
-        self.sh_soft_threshold = 0.0
+        self.sh_soft_threshold = 0.002
         self.sh_compress_interval = 1
         self.sh_compress_added_only = 1
         self.rotate_sh = False
