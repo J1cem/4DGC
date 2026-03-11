@@ -719,6 +719,7 @@ class GaussianModel:
     def training_one_frame_s2_setup(self, training_args):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        grad_norm = torch.norm(grads, dim=-1)
 
         contracted_xyz=self.get_contracted_xyz()                          
         mask = (contracted_xyz >= 0) & (contracted_xyz <= 1)
@@ -750,6 +751,13 @@ class GaussianModel:
         selected_pts_mask_clone = torch.logical_and(xyz_mask, rot_mask)
         selected_pts_mask_clone = torch.logical_and(selected_pts_mask_clone, scale_mask)
         selected_pts_mask_clone = torch.logical_and(selected_pts_mask_clone, mask)
+
+        if selected_pts_mask_spawn.sum() == 0 and selected_pts_mask_clone.sum() == 0:
+            candidate_idx = torch.where(mask)[0]
+            if candidate_idx.numel() > 0:
+                fallback_k = min(int(training_args.num_of_spawn), int(candidate_idx.numel()))
+                top_local_idx = torch.topk(grad_norm[candidate_idx], k=fallback_k, largest=True).indices
+                selected_pts_mask_clone[candidate_idx[top_local_idx]] = True
 
         added_xyz_clone = self.get_xyz[selected_pts_mask_clone].clone().detach().requires_grad_(True)
         added_features_dc_clone = self.get_features[:, 0:1, :][selected_pts_mask_clone].clone().detach().requires_grad_(True)
@@ -810,7 +818,9 @@ class GaussianModel:
         added_mask=torch.zeros((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
         added_mask[-self._added_xyz.shape[0]:]=True
         self._added_mask=added_mask
-        
+        self._prev_added_xyz = None
+        self._reset_transient_tracking()
+
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):

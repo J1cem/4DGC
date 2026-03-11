@@ -178,8 +178,10 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
     if(opt.iterations_s2>0):
     # Prune, Clone and setting up  
         gaussians.training_one_frame_s2_setup(opt)
+        print(f"[Stage2] Initialized added Gaussians: {gaussians._added_xyz.shape[0]}")
         gaussians.assign_anchor_by_xyz()
         gaussians.limit_added_points(opt.max_added_ratio * opt.compression_ratio_s2)
+        print(f"[Stage2] Added Gaussians after limit: {gaussians._added_xyz.shape[0]}")
         progress_bar = tqdm(range(opt.iterations, opt.iterations + opt.iterations_s2), desc="Training progress of Stage 2")    
         criterion = rdloss(lmbda=0.01)
     # Train the new Gaussians
