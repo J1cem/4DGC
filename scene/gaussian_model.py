@@ -881,7 +881,7 @@ class GaussianModel:
         self._new_xyz = None
         self._new_rot = None
         
-    def compress_sh_attributes(self, soft_threshold=0.0, added_only=True):
+    def compress_sh_attributes(self, soft_threshold=0.0, added_only=True, opacity_aware=True, opacity_alpha=1.5):
         if soft_threshold <= 0:
             return
 
@@ -890,13 +890,30 @@ class GaussianModel:
 
         with torch.no_grad():
             if self._added_features_rest is not None and self._added_features_rest.numel() > 0:
-                self._added_features_rest.data.copy_(
-                    _soft_shrink(self._added_features_rest.data, soft_threshold)
-                )
+                added_sh = self._added_features_rest.data
+                if opacity_aware and self._added_opacity is not None and self._added_opacity.numel() > 0:
+                    added_opacity = self.opacity_activation(self._added_opacity.data).clamp(0.0, 1.0)
+                    per_point_threshold = soft_threshold * (1.0 + opacity_alpha * (1.0 - added_opacity))
+                    self._added_features_rest.data.copy_(
+                        _soft_shrink(added_sh, per_point_threshold.unsqueeze(1))
+                    )
+                else:
+                    self._added_features_rest.data.copy_(
+                        _soft_shrink(added_sh, soft_threshold)
+                    )
+
             if (not added_only) and self._features_rest is not None and self._features_rest.numel() > 0:
-                self._features_rest.data.copy_(
-                    _soft_shrink(self._features_rest.data, soft_threshold)
-                )
+                base_sh = self._features_rest.data
+                if opacity_aware and self._opacity is not None and self._opacity.numel() > 0:
+                    base_opacity = self.opacity_activation(self._opacity.data).clamp(0.0, 1.0)
+                    per_point_threshold = soft_threshold * (1.0 + opacity_alpha * (1.0 - base_opacity))
+                    self._features_rest.data.copy_(
+                        _soft_shrink(base_sh, per_point_threshold.unsqueeze(1))
+                    )
+                else:
+                    self._features_rest.data.copy_(
+                        _soft_shrink(base_sh, soft_threshold)
+                    )
 
     def get_contracted_xyz(self):
         with torch.no_grad():
