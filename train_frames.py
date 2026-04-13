@@ -205,6 +205,10 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             # Loss
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
+            pixel_l1_map = torch.abs(image - gt_image).mean(dim=0)
+            error_q = float(max(0.5, min(0.99, opt.mv_error_quantile)))
+            hard_threshold = torch.quantile(pixel_l1_map.detach().reshape(-1), error_q)
+            high_error_ratio = (pixel_l1_map.detach() > hard_threshold).float().mean()
 
             per_point_error = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda", dtype=torch.float32)
             per_point_error[visibility_filter] = radii[visibility_filter].detach().to(per_point_error.dtype)
@@ -214,7 +218,15 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
                 lifetime=opt.transient_lifetime,
             )
 
-            loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            photo_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            gaussians.update_multiview_consistency(
+                visibility_filter=visibility_filter,
+                radii=radii,
+                photometric_error_scalar=photo_loss.detach().item(),
+                high_error_ratio=high_error_ratio.item(),
+                ema_decay=opt.mv_ema_decay,
+            )
+            loss += photo_loss
 
             # 读取 Gaussian feature
             f_dc = gaussians._added_features_dc.contiguous()

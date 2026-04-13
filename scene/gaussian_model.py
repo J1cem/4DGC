@@ -80,6 +80,9 @@ class GaussianModel:
         self._transient_candidate_mask = None
         self._ema_region_error = None
         self._prev_added_xyz = None
+        self.mv_add_score = torch.empty(0)
+        self.mv_prune_score = torch.empty(0)
+        self.mv_seen_views = torch.empty(0)
         
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -89,6 +92,43 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+
+    def _ensure_multiview_buffers(self):
+        n_points = self.get_xyz.shape[0]
+        if self.mv_add_score.numel() != n_points:
+            self.mv_add_score = torch.zeros((n_points,), device="cuda")
+            self.mv_prune_score = torch.zeros((n_points,), device="cuda")
+            self.mv_seen_views = torch.zeros((n_points,), device="cuda")
+
+    def reset_multiview_consistency(self):
+        self._ensure_multiview_buffers()
+        self.mv_add_score.zero_()
+        self.mv_prune_score.zero_()
+        self.mv_seen_views.zero_()
+
+    def update_multiview_consistency(self, visibility_filter, radii, photometric_error_scalar,
+                                     high_error_ratio, ema_decay=0.9):
+        self._ensure_multiview_buffers()
+        vis_mask = visibility_filter.detach()
+        if vis_mask.numel() == 0 or not torch.any(vis_mask):
+            return
+
+        visible_radii = radii[vis_mask].detach()
+        radius_norm = visible_radii / (visible_radii.mean() + 1e-6)
+        radius_norm = torch.clamp(radius_norm, min=0.25, max=4.0)
+        photo = float(photometric_error_scalar)
+        hard_ratio = float(high_error_ratio)
+
+        add_signal = torch.clamp(radius_norm * hard_ratio, min=0.0, max=1.0)
+        prune_signal = torch.clamp(radius_norm * photo, min=0.0, max=1.0)
+
+        self.mv_add_score[vis_mask] = (
+            ema_decay * self.mv_add_score[vis_mask] + (1.0 - ema_decay) * add_signal
+        )
+        self.mv_prune_score[vis_mask] = (
+            ema_decay * self.mv_prune_score[vis_mask] + (1.0 - ema_decay) * prune_signal
+        )
+        self.mv_seen_views[vis_mask] += 1.0
 
     def capture(self):
         return (
@@ -476,6 +516,7 @@ class GaussianModel:
         self.color_gradient_accum = self.color_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self.reset_multiview_consistency()
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -521,6 +562,7 @@ class GaussianModel:
         self.color_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.reset_multiview_consistency()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -606,6 +648,7 @@ class GaussianModel:
         self._added_mask=added_mask
         self._prev_added_xyz = None
         self._reset_transient_tracking()
+        self.reset_multiview_consistency()
 
     def _sync_added_tracking_by_mask(self, valid_points_mask):
         if self._transient_remaining_life is not None and self._transient_remaining_life.numel() > 0:
@@ -664,6 +707,14 @@ class GaussianModel:
     def adding_and_prune(self, training_args, extent, force_add=False):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        self._ensure_multiview_buffers()
+        mv_enabled = bool(getattr(training_args, "mv_consistency_enable", False))
+        mv_add_threshold = float(getattr(training_args, "mv_add_threshold", 0.0))
+        mv_min_views = float(getattr(training_args, "mv_min_views", 0.0))
+        if mv_enabled and mv_add_threshold > 0:
+            reliable = self.mv_seen_views >= mv_min_views
+            low_consistency = torch.logical_and(reliable, self.mv_add_score < mv_add_threshold)
+            grads[low_consistency] = 0.0
         should_add = bool(training_args.s2_adding or force_add)
         if should_add:
             add_before = self._added_xyz.shape[0] if self._added_xyz is not None else 0
@@ -696,17 +747,26 @@ class GaussianModel:
                         training_args.max_added_scale,
                     )
         if self._added_xyz.shape[0]>0:
-            self.prune_added_points(training_args.min_opacity, extent, training_args.max_added_scale)
+            self.prune_added_points(training_args.min_opacity, extent, training_args.max_added_scale, training_args)
             self.limit_added_points(training_args.max_added_ratio)
         torch.cuda.empty_cache()
 
-    def prune_added_points(self, min_opacity, extent, max_added_scale=-1):
+    def prune_added_points(self, min_opacity, extent, max_added_scale=-1, training_args=None):
+        self._ensure_multiview_buffers()
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
         prune_mask = torch.logical_or(prune_mask, big_points_ws)[-self._added_xyz.shape[0]:]
         if max_added_scale > 0:
             over_scale_mask = self.get_scaling[-self._added_xyz.shape[0]:].max(dim=1).values > max_added_scale
             prune_mask = torch.logical_or(prune_mask, over_scale_mask)
+        if training_args is not None and bool(getattr(training_args, "mv_consistency_enable", False)):
+            mv_prune_threshold = float(getattr(training_args, "mv_prune_threshold", 0.0))
+            mv_min_views = float(getattr(training_args, "mv_min_views", 0.0))
+            if mv_prune_threshold > 0:
+                added_seen = self.mv_seen_views[-self._added_xyz.shape[0]:]
+                added_prune_score = self.mv_prune_score[-self._added_xyz.shape[0]:]
+                mv_prune_mask = torch.logical_and(added_seen >= mv_min_views, added_prune_score < mv_prune_threshold)
+                prune_mask = torch.logical_or(prune_mask, mv_prune_mask)
         valid_points_mask = ~prune_mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -726,6 +786,7 @@ class GaussianModel:
         added_mask[-self._added_xyz.shape[0]:]=True
         self._added_mask=added_mask
         self._sync_added_tracking_by_mask(valid_points_mask)
+        self.reset_multiview_consistency()
         torch.cuda.empty_cache()
         
     def limit_added_points(self, max_added_ratio):
@@ -752,6 +813,7 @@ class GaussianModel:
         added_mask[-self._added_xyz.shape[0]:]=True
         self._added_mask=added_mask
         self._sync_added_tracking_by_mask(valid_points_mask)
+        self.reset_multiview_consistency()
 
     def training_one_frame_s2_setup(self, training_args):
         grads = self.xyz_gradient_accum / self.denom
@@ -857,6 +919,7 @@ class GaussianModel:
         self._added_mask=added_mask
         self._prev_added_xyz = None
         self._reset_transient_tracking()
+        self.reset_multiview_consistency()
 
         torch.cuda.empty_cache()
 
@@ -1031,6 +1094,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.color_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.reset_multiview_consistency()
         
     def get_masked_gaussian(self, mask):        
         new_gaussian = GaussianModel(self.max_sh_degree)
