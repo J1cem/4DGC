@@ -113,7 +113,9 @@ class GaussianModel:
         if vis_mask.numel() == 0 or not torch.any(vis_mask):
             return
 
-        visible_radii = radii[vis_mask].detach()
+        visible_radii = radii[vis_mask].detach().to(dtype=torch.float32)
+        if visible_radii.numel() == 0:
+            return
         radius_norm = visible_radii / (visible_radii.mean() + 1e-6)
         radius_norm = torch.clamp(radius_norm, min=0.25, max=4.0)
         photo = float(photometric_error_scalar)
