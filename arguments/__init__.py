@@ -124,12 +124,6 @@ class OptimizationParams(ParamGroup):
         self.mv_prune_threshold = 0.02
         self.mv_min_views = 6
         self.mv_ema_decay = 0.9
-        self.s1_mv_prune_enable = True
-        self.s1_mv_prune_interval = 200
-        self.s1_mv_prune_warmup = 800
-        self.s1_mv_prune_threshold = 0.015
-        self.s1_mv_opacity_threshold = 0.03
-        self.s1_mv_max_prune_ratio = 0.03
         self.sh_soft_threshold = 0.0
         self.sh_compress_interval = 1
         self.sh_compress_added_only = 1

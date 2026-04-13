@@ -132,46 +132,6 @@ class GaussianModel:
         )
         self.mv_seen_views[vis_mask] += 1.0
 
-    def prune_points_stage1(self, prune_mask):
-        valid_points_mask = ~prune_mask
-        if valid_points_mask.sum() <= 0:
-            return
-        self._xyz = nn.Parameter(self._xyz[valid_points_mask].detach().requires_grad_(True))
-        self._features_dc = nn.Parameter(self._features_dc[valid_points_mask].detach().requires_grad_(True))
-        self._features_rest = nn.Parameter(self._features_rest[valid_points_mask].detach().requires_grad_(True))
-        self._opacity = nn.Parameter(self._opacity[valid_points_mask].detach().requires_grad_(True))
-        self._scaling = nn.Parameter(self._scaling[valid_points_mask].detach().requires_grad_(True))
-        self._rotation = nn.Parameter(self._rotation[valid_points_mask].detach().requires_grad_(True))
-
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.color_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.reset_multiview_consistency()
-
-    def prune_stage1_by_multiview(self, training_args):
-        self._ensure_multiview_buffers()
-        if self.get_xyz.shape[0] <= 1024:
-            return 0
-        reliable = self.mv_seen_views >= float(getattr(training_args, "mv_min_views", 6))
-        low_mv = self.mv_prune_score < float(getattr(training_args, "s1_mv_prune_threshold", 0.015))
-        low_opacity = self.get_opacity.squeeze() < float(getattr(training_args, "s1_mv_opacity_threshold", 0.03))
-        candidate_mask = reliable & low_mv & low_opacity
-        candidate_idx = torch.where(candidate_mask)[0]
-        if candidate_idx.numel() == 0:
-            return 0
-
-        max_ratio = float(getattr(training_args, "s1_mv_max_prune_ratio", 0.03))
-        max_prune = max(1, int(self.get_xyz.shape[0] * max_ratio))
-        prune_k = min(int(candidate_idx.numel()), max_prune)
-        scores = self.mv_prune_score[candidate_idx]
-        prune_local = torch.topk(scores, k=prune_k, largest=False).indices
-        prune_idx = candidate_idx[prune_local]
-        prune_mask = torch.zeros((self.get_xyz.shape[0],), device="cuda", dtype=torch.bool)
-        prune_mask[prune_idx] = True
-        self.prune_points_stage1(prune_mask)
-        return int(prune_k)
-
     def capture(self):
         return (
             self.active_sh_degree,
