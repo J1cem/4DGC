@@ -160,7 +160,19 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
             ssim_img = ssim(image,gt_image)
-            loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_img)
+            pixel_l1_map = torch.abs(image - gt_image).mean(dim=0)
+            error_q = float(max(0.5, min(0.99, opt.mv_error_quantile)))
+            hard_threshold = torch.quantile(pixel_l1_map.detach().reshape(-1), error_q)
+            high_error_ratio = (pixel_l1_map.detach() > hard_threshold).float().mean()
+            photo_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_img)
+            gaussians.update_multiview_consistency(
+                visibility_filter=visibility_filter,
+                radii=radii,
+                photometric_error_scalar=photo_loss.detach().item(),
+                high_error_ratio=high_error_ratio.item(),
+                ema_decay=opt.mv_ema_decay,
+            )
+            loss += photo_loss
             loss += 1e-5 * gaussians.mem.model.train_entropy(q=dataset.q) 
 
         loss/=opt.batch_size
@@ -200,6 +212,15 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.output_path + "/chkpnt" + str(iteration) + ".pth")
+
+            if (
+                bool(getattr(opt, "s1_mv_prune_enable", False))
+                and iteration >= int(getattr(opt, "s1_mv_prune_warmup", 800))
+                and iteration % max(1, int(getattr(opt, "s1_mv_prune_interval", 200))) == 0
+            ):
+                n_pruned = gaussians.prune_stage1_by_multiview(opt)
+                if n_pruned > 0:
+                    print(f"[Stage1][ITER {iteration}] multi-view pruned points: {n_pruned}")
 
             # Optimizer step
             if iteration <= opt.iterations:
