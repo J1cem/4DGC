@@ -11,6 +11,7 @@
 import time
 import os
 import csv
+from pathlib import Path
 import torch
 import pickle
 from random import randint
@@ -36,6 +37,41 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 _TB_HIST_DISABLED = False
+
+
+def compute_storage_metrics(frame_output_path, fps=30.0):
+    frame_dir = Path(frame_output_path)
+    metrics = {
+        "checkpoint_size_kb": 0.0,
+        "model_artifact_size_kb": 0.0,
+        "entropy_bitstream_size_kb": 0.0,
+        "real_bitrate_kbps": 0.0,
+    }
+    if not frame_dir.exists():
+        return metrics
+
+    ckpt_files = list(frame_dir.glob("chkpnt*.pth"))
+    if ckpt_files:
+        metrics["checkpoint_size_kb"] = max(f.stat().st_size for f in ckpt_files) / 1024.0
+
+    point_cloud_root = frame_dir / "point_cloud"
+    if point_cloud_root.exists():
+        iter_dirs = sorted(
+            [p for p in point_cloud_root.glob("iteration_*") if p.is_dir()],
+            key=lambda p: int(p.name.split("_")[-1]),
+        )
+        if iter_dirs:
+            latest_iter = iter_dirs[-1]
+            model_files = list(latest_iter.rglob("*.ply"))
+            metrics["model_artifact_size_kb"] = sum(f.stat().st_size for f in model_files) / 1024.0
+
+            bitstream_files = [f for f in latest_iter.rglob("feature*") if f.is_file()]
+            bitstream_bytes = sum(f.stat().st_size for f in bitstream_files)
+            metrics["entropy_bitstream_size_kb"] = bitstream_bytes / 1024.0
+            if fps > 0:
+                metrics["real_bitrate_kbps"] = (bitstream_bytes * 8.0 * fps) / 1000.0
+
+    return metrics
 
 class rdloss(torch.nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
@@ -470,6 +506,10 @@ def train_frames(lp, op, pp, args):
     result2_psnr = []
     result1_ssim = []
     result2_ssim = []
+    ckpt_sizes = []
+    model_sizes = []
+    bitstream_sizes = []
+    real_bitrates = []
     csv_rows = []
     for frame in frames:
         start_time = time.time()
@@ -490,6 +530,11 @@ def train_frames(lp, op, pp, args):
         result2_ssim.append(stage2_ssim)
 
         frame_time = time.time()-start_time
+        storage_metrics = compute_storage_metrics(args.output_path, fps=float(getattr(args, "fps", 30.0)))
+        ckpt_sizes.append(storage_metrics["checkpoint_size_kb"])
+        model_sizes.append(storage_metrics["model_artifact_size_kb"])
+        bitstream_sizes.append(storage_metrics["entropy_bitstream_size_kb"])
+        real_bitrates.append(storage_metrics["real_bitrate_kbps"])
         csv_rows.append({
             'frame': frame,
             'preparation_time': float(res_dict.get('preparation_time', 0.0)),
@@ -505,6 +550,14 @@ def train_frames(lp, op, pp, args):
             'avg_stage1_ssim': float(sum(result1_ssim)/len(result1_ssim)),
             'avg_stage2_psnr': float(sum(result2_psnr)/len(result2_psnr)),
             'avg_stage2_ssim': float(sum(result2_ssim)/len(result2_ssim)),
+            'checkpoint_size_kb': float(storage_metrics['checkpoint_size_kb']),
+            'model_artifact_size_kb': float(storage_metrics['model_artifact_size_kb']),
+            'entropy_bitstream_size_kb': float(storage_metrics['entropy_bitstream_size_kb']),
+            'real_bitrate_kbps': float(storage_metrics['real_bitrate_kbps']),
+            'avg_checkpoint_size_kb': float(sum(ckpt_sizes)/len(ckpt_sizes)),
+            'avg_model_artifact_size_kb': float(sum(model_sizes)/len(model_sizes)),
+            'avg_entropy_bitstream_size_kb': float(sum(bitstream_sizes)/len(bitstream_sizes)),
+            'avg_real_bitrate_kbps': float(sum(real_bitrates)/len(real_bitrates)),
             'frame_total_time': float(frame_time),
         })
 
@@ -534,6 +587,14 @@ def train_frames(lp, op, pp, args):
         'avg_stage1_ssim',
         'avg_stage2_psnr',
         'avg_stage2_ssim',
+        'checkpoint_size_kb',
+        'model_artifact_size_kb',
+        'entropy_bitstream_size_kb',
+        'real_bitrate_kbps',
+        'avg_checkpoint_size_kb',
+        'avg_model_artifact_size_kb',
+        'avg_entropy_bitstream_size_kb',
+        'avg_real_bitrate_kbps',
         'frame_total_time',
     ]
     with open(csv_path, 'w', newline='') as csv_file:
@@ -555,6 +616,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--frame_start', type=int, default=1)
     parser.add_argument('--frame_end', type=int, default=150)
+    parser.add_argument('--fps', type=float, default=30.0)
     parser.add_argument('--load_iteration', type=int, default=None)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
