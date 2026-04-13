@@ -118,6 +118,12 @@ class OptimizationParams(ParamGroup):
         self.mutation_spike_factor = 2.5
         self.transient_lifetime = 12
         self.max_added_scale = 0.06
+        self.mv_consistency_enable = True
+        self.mv_error_quantile = 0.85
+        self.mv_add_threshold = 0.12
+        self.mv_prune_threshold = 0.02
+        self.mv_min_views = 6
+        self.mv_ema_decay = 0.9
         self.sh_soft_threshold = 0.0
         self.sh_compress_interval = 1
         self.sh_compress_added_only = 1
