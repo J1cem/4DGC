@@ -584,8 +584,12 @@ class GaussianModel:
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
+        pruneable_groups = {
+            "xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation",
+            "added_xyz", "added_f_dc", "added_f_rest", "added_opacity", "added_scaling", "added_rotation",
+        }
         for group in self.optimizer.param_groups:
-            if group["name"] == "entropy_model":
+            if group.get("name") not in pruneable_groups:
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
@@ -626,10 +630,12 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            assert len(group["params"]) == 1
-            if group["name"] == 'entropy_model':
+            group_name = group.get("name")
+            if group_name not in tensors_dict:
                 continue
-            extension_tensor = tensors_dict[group["name"]]
+            if len(group["params"]) != 1:
+                continue
+            extension_tensor = tensors_dict[group_name]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
 
@@ -640,10 +646,10 @@ class GaussianModel:
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
                 self.optimizer.state[group['params'][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = group["params"][0]
+                optimizable_tensors[group_name] = group["params"][0]
             else:
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
-                optimizable_tensors[group["name"]] = group["params"][0]
+                optimizable_tensors[group_name] = group["params"][0]
 
         return optimizable_tensors
 
