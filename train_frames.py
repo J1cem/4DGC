@@ -124,6 +124,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    criterion = rdloss(lmbda=0.01)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -174,6 +175,35 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             )
             loss += photo_loss
             loss += 1e-5 * gaussians.mem.model.train_entropy(q=dataset.q) 
+            if bool(getattr(opt, "pcgs_stage1_enable", 1)) and opt.lambda_rd_base > 0:
+                base_f_dc = gaussians._features_dc.contiguous()
+                base_f_rest = gaussians._features_rest.contiguous()
+                base_features = torch.cat((base_f_dc, base_f_rest), dim=1)
+                base_anchor_feat = gaussians.anchor_features[gaussians.anchor_ids]
+                base_residual = base_features - base_anchor_feat
+                sampled_level = int(torch.randint(
+                    low=1,
+                    high=int(getattr(opt, "pcgs_levels", 3)) + 1,
+                    size=(1,),
+                    device=base_residual.device,
+                ).item())
+                temporal_code = float(iteration) / float(max(1, opt.iterations))
+                progressive_residual, progressive_entropy, mask_sparsity, _ = gaussians.progressive_quantize_residual(
+                    residual=base_residual,
+                    level=sampled_level,
+                    temporal_code=temporal_code,
+                )
+                attributes = progressive_residual.view(
+                    progressive_residual.shape[0],
+                    progressive_residual.shape[1],
+                    3,
+                    1,
+                ).permute(3, 1, 2, 0)
+                y_hat, y_likelihoods = gaussians.entropy_bottleneck(attributes)
+                codec_loss = criterion(y_hat, y_likelihoods, attributes)['loss']
+                loss += opt.lambda_rd_base * codec_loss
+                loss += float(getattr(opt, "pcgs_entropy_weight", 0.1)) * progressive_entropy
+                loss += 0.01 * mask_sparsity
 
         loss/=opt.batch_size
         loss.backward()
@@ -241,7 +271,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
         gaussians.limit_added_points(opt.max_added_ratio * opt.compression_ratio_s2)
         print(f"[Stage2] Added Gaussians after limit: {gaussians._added_xyz.shape[0]}")
         progress_bar = tqdm(range(opt.iterations, opt.iterations + opt.iterations_s2), desc="Training progress of Stage 2")    
-        criterion = rdloss(lmbda=0.01)
+        criterion_s2 = rdloss(lmbda=0.01)
     # Train the new Gaussians
     for iteration in range(opt.iterations + 1, opt.iterations + opt.iterations_s2 + 1):        
         iter_start.record()
@@ -291,15 +321,26 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
             features = torch.cat((f_dc, f_rest), dim=1)
 
-            # ===== Anchor residual =====
+            # ===== Progressive anchor residual =====
             anchor_feat = gaussians.anchor_features[gaussians.anchor_ids]
-
             residual = features - anchor_feat
+            sampled_level = int(torch.randint(
+                low=1,
+                high=int(getattr(opt, "pcgs_levels", 3)) + 1,
+                size=(1,),
+                device=residual.device,
+            ).item())
+            temporal_code = float(iteration - opt.iterations) / float(max(1, opt.iterations_s2))
+            progressive_residual, progressive_entropy, mask_sparsity, _ = gaussians.progressive_quantize_residual(
+                residual=residual,
+                level=sampled_level,
+                temporal_code=temporal_code,
+            )
 
             # reshape 为 entropy model 需要的格式
-            attributes = residual.view(
-                residual.shape[0],
-                residual.shape[1],
+            attributes = progressive_residual.view(
+                progressive_residual.shape[0],
+                progressive_residual.shape[1],
                 3,
                 1
             ).permute(3,1,2,0)
@@ -308,7 +349,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             y_hat, y_likelihoods = gaussians.entropy_bottleneck_added(attributes)
 
             # RD loss
-            codec_loss = criterion(y_hat, y_likelihoods, attributes)['loss']
+            codec_loss = criterion_s2(y_hat, y_likelihoods, attributes)['loss']
 
             # regularization for artifact reduction and compactness
             opacity_sparse = gaussians.get_opacity[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
@@ -316,6 +357,8 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
             group_rigid_reg = gaussians.apply_group_rigid_motion()
             loss += opt.lambda_rd_base * codec_loss
+            loss += float(getattr(opt, "pcgs_entropy_weight", 0.1)) * progressive_entropy
+            loss += 0.01 * mask_sparsity
             loss += opt.lambda_opacity_sparse * opacity_sparse
             loss += opt.lambda_scale_reg * scale_reg
             loss += opt.lambda_group_se3 * group_rigid_reg

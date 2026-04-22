@@ -52,6 +52,7 @@ class GaussianModel:
         self.active_sh_degree = 0
         self.q = q
         self.max_sh_degree = sh_degree  
+        self.entropy_bottleneck = EntropyBottleneck(channels=(1+self.max_sh_degree)**2, entropy_coder='rangecoder').to("cuda")
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -80,6 +81,8 @@ class GaussianModel:
         self._transient_candidate_mask = None
         self._ema_region_error = None
         self._prev_added_xyz = None
+        self.progressive_cfg = None
+        self.progressive_context_mlp = None
         self.mv_add_score = torch.empty(0)
         self.mv_prune_score = torch.empty(0)
         self.mv_seen_views = torch.empty(0)
@@ -105,6 +108,106 @@ class GaussianModel:
         self.mv_add_score.zero_()
         self.mv_prune_score.zero_()
         self.mv_seen_views.zero_()
+
+    def setup_progressive_compression(self, training_args):
+        num_levels = int(max(1, getattr(training_args, "pcgs_levels", 3)))
+        self.progressive_cfg = {
+            "num_levels": num_levels,
+            "mask_threshold": float(getattr(training_args, "pcgs_mask_threshold", 0.5)),
+            "base_quant_step": float(getattr(training_args, "pcgs_quant_step", 1e-3)),
+            "temporal_context_weight": float(getattr(training_args, "pcgs_temporal_context_weight", 0.25)),
+            "entropy_weight": float(getattr(training_args, "pcgs_entropy_weight", 0.1)),
+        }
+        self.progressive_context_mlp = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 3),
+        ).to("cuda")
+
+    def _build_progressive_masks(self, residual, level):
+        if self.progressive_cfg is None:
+            raise RuntimeError("Progressive compression is not initialized.")
+        num_levels = self.progressive_cfg["num_levels"]
+        mask_threshold = self.progressive_cfg["mask_threshold"]
+        level = int(max(1, min(level, num_levels)))
+        feat_norm = residual.abs().mean(dim=(1, 2))
+        opacity = self.get_opacity[-residual.shape[0]:].squeeze(-1).detach()
+        if self.mv_add_score.numel() >= self.get_xyz.shape[0]:
+            mv_score = self.mv_add_score[-residual.shape[0]:].detach()
+        else:
+            mv_score = torch.zeros_like(feat_norm)
+        importance = feat_norm + 0.5 * opacity + 0.2 * mv_score
+        importance = (importance - importance.mean()) / (importance.std() + 1e-6)
+
+        masks = []
+        for s in range(1, num_levels + 1):
+            threshold = -1.0 + 2.0 * (s - 1) / max(1, (num_levels - 1))
+            raw_mask = torch.sigmoid(importance - threshold)
+            masks.append(raw_mask > mask_threshold)
+
+        monotonic_masks = []
+        running = torch.zeros_like(masks[0], dtype=torch.bool)
+        for m in masks:
+            running = torch.logical_or(running, m)
+            monotonic_masks.append(running.clone())
+
+        cur_mask = monotonic_masks[level - 1]
+        prev_mask = monotonic_masks[level - 2] if level > 1 else torch.zeros_like(cur_mask)
+        return cur_mask, prev_mask
+
+    def _trit_refine(self, target, coarse, step):
+        left = coarse - step
+        center = coarse
+        right = coarse + step
+        candidates = torch.stack([left, center, right], dim=-1)
+        dist = torch.abs(candidates - target.unsqueeze(-1))
+        trit_idx = torch.argmin(dist, dim=-1)
+        refined = torch.gather(candidates, dim=-1, index=trit_idx.unsqueeze(-1)).squeeze(-1)
+        return refined, trit_idx
+
+    def progressive_quantize_residual(self, residual, level, temporal_code):
+        if self.progressive_cfg is None:
+            raise RuntimeError("Progressive compression is not initialized.")
+        num_levels = self.progressive_cfg["num_levels"]
+        level = int(max(1, min(level, num_levels)))
+        base_q = self.progressive_cfg["base_quant_step"]
+
+        active_mask, prev_mask = self._build_progressive_masks(residual, level)
+        new_mask = torch.logical_and(active_mask, ~prev_mask)
+        refine_mask = prev_mask
+
+        quantized = torch.zeros_like(residual)
+        entropy_proxy = torch.tensor(0.0, device=residual.device)
+        coarse = torch.round(residual / base_q) * base_q
+
+        if torch.any(new_mask):
+            quantized[new_mask] = coarse[new_mask]
+        prev_quant = coarse
+        for s in range(2, level + 1):
+            step = base_q / (3 ** (s - 1))
+            refined, trit_idx = self._trit_refine(residual, prev_quant, step)
+            if torch.any(refine_mask):
+                quantized[refine_mask] = refined[refine_mask]
+                context_in = torch.stack([
+                    prev_quant[refine_mask].reshape(-1),
+                    residual[refine_mask].reshape(-1),
+                    torch.full(
+                        (prev_quant[refine_mask].numel(),),
+                        float(temporal_code) * self.progressive_cfg["temporal_context_weight"],
+                        device=residual.device,
+                    ),
+                ], dim=1)
+                logits = self.progressive_context_mlp(context_in)
+                trits = trit_idx[refine_mask].reshape(-1).long()
+                entropy_proxy = entropy_proxy + F.cross_entropy(logits, trits)
+            prev_quant = refined
+
+        active_mask_3d = active_mask[:, None, None].to(residual.dtype)
+        quantized = quantized * active_mask_3d
+        mask_sparsity = active_mask.float().mean()
+        return quantized, entropy_proxy, mask_sparsity, active_mask
 
     def update_multiview_consistency(self, visibility_filter, radii, photometric_error_scalar,
                                      high_error_ratio, ema_decay=0.9):
@@ -818,6 +921,7 @@ class GaussianModel:
         self.reset_multiview_consistency()
 
     def training_one_frame_s2_setup(self, training_args):
+        self.setup_progressive_compression(training_args)
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
         grad_norm = torch.norm(grads, dim=-1)
@@ -909,6 +1013,8 @@ class GaussianModel:
         self.entropy_bottleneck_added = EntropyBottleneck(channels=(1+self.max_sh_degree)**2,entropy_coder='rangecoder').to('cuda')
         for param in self.entropy_bottleneck_added.parameters():
             l.append({'params': [param], 'lr': 1e-3,  "name": "entropy_model"})
+        if self.progressive_context_mlp is not None:
+            l.append({'params': self.progressive_context_mlp.parameters(), 'lr': 1e-3, "name": "pcgs_context"})
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -1084,13 +1190,19 @@ class GaussianModel:
                      
     def training_one_frame_setup(self,training_args):
         print('training_one_frame_setup')
+        self.setup_progressive_compression(training_args)
         model = Motion_Grid(q = self.q).to(torch.device("cuda"))
         self.mem=Motion_Estimation_Module(model,self.get_xyz_bound()[0],self.get_xyz_bound()[1])
         self.mem.load_state_dict(torch.load(training_args.mem_path),strict = False)
         
         self._xyz_bound_min = self.mem.xyz_bound_min
         self._xyz_bound_max = self.mem.xyz_bound_max
-        self.mem_optimizer = torch.optim.Adam(self.mem.model.get_optparam_groups())  
+        opt_groups = list(self.mem.model.get_optparam_groups())
+        for param in self.entropy_bottleneck.parameters():
+            opt_groups.append({'params': [param], 'lr': 1e-3, "name": "s1_entropy_model"})
+        if self.progressive_context_mlp is not None:
+            opt_groups.append({'params': self.progressive_context_mlp.parameters(), 'lr': 1e-3, "name": "pcgs_context"})
+        self.mem_optimizer = torch.optim.Adam(opt_groups)
         self.scheduler = lr_scheduler.StepLR(self.mem_optimizer, step_size=10, gamma=0.1)
                  
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
