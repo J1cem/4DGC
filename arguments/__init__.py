@@ -136,6 +136,12 @@ class OptimizationParams(ParamGroup):
         self.sh_threshold_relative_cap = 0.15
         self.sh_sparsity_ratio = 0.35
         self.sh_quant_step = 0.0005
+        self.pcgs_levels = 3
+        self.pcgs_mask_threshold = 0.5
+        self.pcgs_quant_step = 0.001
+        self.pcgs_temporal_context_weight = 0.25
+        self.pcgs_entropy_weight = 0.1
+        self.pcgs_stage1_enable = 1
         self.s2_min_add_candidates = 128
         self.rotate_sh = False
         self.only_mlp = False
