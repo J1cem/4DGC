@@ -261,171 +261,15 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
     s1_end_time=time.time()
     # Dump the MEM
     scene.dump_MEM()
-    # Update Gaussians by MEM
+    # Update Gaussians by MEM only. Stage 2 point adding is intentionally
+    # disabled so frame training ends after motion/MEM optimization.
     gaussians.update_by_mem()
-    if(opt.iterations_s2>0):
-    # Prune, Clone and setting up  
-        gaussians.training_one_frame_s2_setup(opt)
-        print(f"[Stage2] Initialized added Gaussians: {gaussians._added_xyz.shape[0]}")
-        gaussians.assign_anchor_by_xyz()
-        gaussians.limit_added_points(opt.max_added_ratio * opt.compression_ratio_s2)
-        print(f"[Stage2] Added Gaussians after limit: {gaussians._added_xyz.shape[0]}")
-        progress_bar = tqdm(range(opt.iterations, opt.iterations + opt.iterations_s2), desc="Training progress of Stage 2")    
-        criterion_s2 = rdloss(lmbda=0.01)
-    # Train the new Gaussians
-    for iteration in range(opt.iterations + 1, opt.iterations + opt.iterations_s2 + 1):        
-        iter_start.record()
-        
-        loss = torch.tensor(0.).cuda()
-        for batch_iteraion in range(opt.batch_size):
-        
-            # Pick a random Camera
-            if not viewpoint_stack:
-                viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-            
-            # Render
-            if (iteration - 1) == debug_from:
-                pipe.debug = True
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-            image, depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"],render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            # Loss
-            gt_image = viewpoint_cam.original_image.cuda()
-            Ll1 = l1_loss(image, gt_image)
-            pixel_l1_map = torch.abs(image - gt_image).mean(dim=0)
-            error_q = float(max(0.5, min(0.99, opt.mv_error_quantile)))
-            hard_threshold = torch.quantile(pixel_l1_map.detach().reshape(-1), error_q)
-            high_error_ratio = (pixel_l1_map.detach() > hard_threshold).float().mean()
 
-            per_point_error = torch.zeros((gaussians.get_xyz.shape[0],), device="cuda", dtype=torch.float32)
-            per_point_error[visibility_filter] = radii[visibility_filter].detach().to(per_point_error.dtype)
-            gaussians.update_transient_mutation_state(
-                per_point_error,
-                spike_factor=opt.mutation_spike_factor,
-                lifetime=opt.transient_lifetime,
-            )
-
-            photo_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-            gaussians.update_multiview_consistency(
-                visibility_filter=visibility_filter,
-                radii=radii,
-                photometric_error_scalar=photo_loss.detach().item(),
-                high_error_ratio=high_error_ratio.item(),
-                ema_decay=opt.mv_ema_decay,
-            )
-            loss += photo_loss
-
-            # 读取 Gaussian feature
-            f_dc = gaussians._added_features_dc.contiguous()
-            f_rest = gaussians._added_features_rest.contiguous()
-
-            features = torch.cat((f_dc, f_rest), dim=1)
-
-            # ===== Progressive anchor residual =====
-            anchor_feat = gaussians.anchor_features[gaussians.anchor_ids]
-            residual = features - anchor_feat
-            sampled_level = int(torch.randint(
-                low=1,
-                high=int(getattr(opt, "pcgs_levels", 3)) + 1,
-                size=(1,),
-                device=residual.device,
-            ).item())
-            temporal_code = float(iteration - opt.iterations) / float(max(1, opt.iterations_s2))
-            progressive_residual, progressive_entropy, mask_sparsity, _ = gaussians.progressive_quantize_residual(
-                residual=residual,
-                level=sampled_level,
-                temporal_code=temporal_code,
-            )
-
-            # reshape 为 entropy model 需要的格式
-            attributes = progressive_residual.view(
-                progressive_residual.shape[0],
-                progressive_residual.shape[1],
-                3,
-                1
-            ).permute(3,1,2,0)
-
-            # entropy coding residual
-            y_hat, y_likelihoods = gaussians.entropy_bottleneck_added(attributes)
-
-            # RD loss
-            codec_loss = criterion_s2(y_hat, y_likelihoods, attributes)['loss']
-
-            # regularization for artifact reduction and compactness
-            opacity_sparse = gaussians.get_opacity[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
-            scale_reg = gaussians.get_scaling[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
-
-            group_rigid_reg = gaussians.apply_group_rigid_motion()
-            loss += opt.lambda_rd_base * codec_loss
-            loss += float(getattr(opt, "pcgs_entropy_weight", 0.1)) * progressive_entropy
-            loss += 0.01 * mask_sparsity
-            loss += opt.lambda_opacity_sparse * opacity_sparse
-            loss += opt.lambda_scale_reg * scale_reg
-            loss += opt.lambda_group_se3 * group_rigid_reg
-            
-        loss/=opt.batch_size
-        loss.backward()
-        
-        iter_end.record()
-        with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            if (iteration - opt.iterations) % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations + opt.iterations_s2:
-                progress_bar.close()
-
-            # Log and save
-            s2_res = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if s2_res is not None:
-                last_s2_res.append(s2_res)
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration=iteration, save_type='added')
-                scene.save(iteration=iteration, save_type='all')
-                             
-            if (iteration - opt.iterations) % opt.densification_interval == 0:
-                gaussians.adding_and_prune(
-                    opt,
-                    scene.cameras_extent,
-                    force_add=((iteration - opt.iterations) <= opt.densification_interval),
-                )
-
-                # ===== 新增：重新分配 anchor =====
-                gaussians.assign_anchor_by_xyz()
-                gaussians.prune_transient_points()
-
-            # Optimizer step
-            if iteration <= opt.iterations + opt.iterations_s2:
-                gaussians.optimizer.step()
-                stage2_it = iteration - opt.iterations
-                if (
-                    opt.sh_soft_threshold > 0
-                    and stage2_it >= max(0, opt.sh_compress_warmup)
-                    and (stage2_it % max(1, opt.sh_compress_interval) == 0)
-                ):
-                    gaussians.compress_sh_attributes(
-                        soft_threshold=opt.sh_soft_threshold,
-                        added_only=bool(opt.sh_compress_added_only),
-                        opacity_aware=bool(opt.sh_compress_opacity_aware),
-                        opacity_alpha=opt.sh_compress_opacity_alpha,
-                        preserve_ratio=opt.sh_preserve_ratio,
-                        low_opacity_only=bool(opt.sh_compress_low_opacity_only),
-                        opacity_cutoff=opt.sh_compress_opacity_cutoff,
-                        relative_threshold_cap=opt.sh_threshold_relative_cap,
-                        sparsity_ratio=opt.sh_sparsity_ratio,
-                        quant_step=opt.sh_quant_step,
-                    )
-                gaussians.optimizer.zero_grad(set_to_none = True)
-
-    s2_end_time=time.time()
-    
     # 计算总训练时间
     pre_time = s1_start_time - start_time
     s1_time = s1_end_time - s1_start_time
-    s2_time = s2_end_time - s1_end_time
-           
+    s2_time = 0.0
+
     return last_s1_res, last_s2_res, pre_time, s1_time, s2_time
 
 def prepare_output_and_logger(args):    
@@ -519,7 +363,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 }
 
 def train_one_frame(lp,op,pp,args):
-    args.save_iterations.append(args.iterations + args.iterations_s2)
+    args.iterations_s2 = 0
+    if args.iterations not in args.save_iterations:
+        args.save_iterations.append(args.iterations)
+    if args.iterations not in args.test_iterations:
+        args.test_iterations.append(args.iterations)
     if args.depth_smooth==0:
         args.bwd_depth=False
     print("Optimizing " + args.output_path)
@@ -531,10 +379,9 @@ def train_one_frame(lp,op,pp,args):
         print("\nTraining complete.")
         print(f"Preparation: {pre_time}")
         print(f"Stage 1: {s1_time}")
-        print(f"Stage 2: {s2_time}")
+        print("Stage 2 disabled (point adding removed).")
         res_dict['preparation_time'] = pre_time
         res_dict['stage1/time'] = s1_time
-        res_dict['stage2/time'] = s2_time
         if s1_ress !=[]:
             for idx, s1_res in enumerate(s1_ress):
                 save_tensor_img(s1_res['last_test_image'],os.path.join(args.output_path,f'{idx}_rendering1'))
@@ -542,21 +389,16 @@ def train_one_frame(lp,op,pp,args):
                 print(f"Stage1/psnr_{idx}: {s1_res['last_test_psnr']}")
                 res_dict[f'stage1/points_num_{idx}']=s1_res['last_points_num']
                 res_dict[f'stage1/ssim_{idx}']=s1_res['last_test_ssim']
-        if s2_ress !=[]:
-            for idx, s2_res in enumerate(s2_ress):
-                save_tensor_img(s2_res['last_test_image'],os.path.join(args.output_path,f'{idx}_rendering2'))
-                res_dict[f'stage2/psnr_{idx}']=s2_res['last_test_psnr']
-                res_dict[f'stage2/points_num_{idx}']=s2_res['last_points_num']
-                res_dict[f'stage2/ssim_{idx}']=s2_res['last_test_ssim']
     return res_dict 
 
 def train_frames(lp, op, pp, args):
     # Initialize system state (RNG)
     safe_state(args.quiet)
+    args.iterations_s2 = 0
     video_path=args.video_path
     output_path=args.output_path
     model_path=args.model_path
-    load_iteration = args.load_iteration
+    frame_load_iteration = args.iterations
     sub_paths = os.listdir(video_path)
     pattern = re.compile(r'colmap_(\d+)')
     frames = sorted(
@@ -566,10 +408,10 @@ def train_frames(lp, op, pp, args):
     frames=frames[args.frame_start:args.frame_end]
     if args.frame_start==1:
         args.load_iteration = args.first_load_iteration
+    else:
+        args.load_iteration = frame_load_iteration
     result1_psnr = []
-    result2_psnr = []
     result1_ssim = []
-    result2_ssim = []
     ckpt_sizes = []
     model_sizes = []
     bitstream_sizes = []
@@ -584,14 +426,10 @@ def train_frames(lp, op, pp, args):
         res_dict = train_one_frame(lp,op,pp,args)
 
         stage1_psnr = float(res_dict.get('stage1/psnr_0', 0.0))
-        stage2_psnr = float(res_dict.get('stage2/psnr_0', stage1_psnr))
         stage1_ssim = float(res_dict.get('stage1/ssim_0', 0.0))
-        stage2_ssim = float(res_dict.get('stage2/ssim_0', stage1_ssim))
 
         result1_psnr.append(stage1_psnr)
-        result2_psnr.append(stage2_psnr)
         result1_ssim.append(stage1_ssim)
-        result2_ssim.append(stage2_ssim)
 
         frame_time = time.time()-start_time
         storage_metrics = compute_storage_metrics(args.output_path, fps=float(getattr(args, "fps", 30.0)))
@@ -603,17 +441,11 @@ def train_frames(lp, op, pp, args):
             'frame': frame,
             'preparation_time': float(res_dict.get('preparation_time', 0.0)),
             'stage1_time': float(res_dict.get('stage1/time', 0.0)),
-            'stage2_time': float(res_dict.get('stage2/time', 0.0)),
             'stage1_psnr_0': stage1_psnr,
             'stage1_ssim_0': stage1_ssim,
             'stage1_points_num_0': int(res_dict.get('stage1/points_num_0', 0)),
-            'stage2_psnr_0': stage2_psnr,
-            'stage2_ssim_0': stage2_ssim,
-            'stage2_points_num_0': int(res_dict.get('stage2/points_num_0', 0)),
             'avg_stage1_psnr': float(sum(result1_psnr)/len(result1_psnr)),
             'avg_stage1_ssim': float(sum(result1_ssim)/len(result1_ssim)),
-            'avg_stage2_psnr': float(sum(result2_psnr)/len(result2_psnr)),
-            'avg_stage2_ssim': float(sum(result2_ssim)/len(result2_ssim)),
             'checkpoint_size_kb': float(storage_metrics['checkpoint_size_kb']),
             'model_artifact_size_kb': float(storage_metrics['model_artifact_size_kb']),
             'entropy_bitstream_size_kb': float(storage_metrics['entropy_bitstream_size_kb']),
@@ -627,12 +459,9 @@ def train_frames(lp, op, pp, args):
 
         output_str = "avg: stage{} PSNR {} SSIM {}".format(1,sum(result1_psnr)/len(result1_psnr),sum(result1_ssim)/len(result1_ssim))
         print(output_str)
-        output_str = "avg: stage{} PSNR {} SSIM {}".format(2,sum(result2_psnr)/len(result2_psnr),sum(result2_ssim)/len(result2_ssim))
-        print(output_str)
-
         print(f"Frame {frame} finished in {frame_time} seconds.")
         model_path = args.output_path
-        args.load_iteration = load_iteration
+        args.load_iteration = frame_load_iteration
         torch.cuda.empty_cache()
 
     csv_path = os.path.join(output_path, "frame_metrics.csv")
@@ -640,17 +469,11 @@ def train_frames(lp, op, pp, args):
         'frame',
         'preparation_time',
         'stage1_time',
-        'stage2_time',
         'stage1_psnr_0',
         'stage1_ssim_0',
         'stage1_points_num_0',
-        'stage2_psnr_0',
-        'stage2_ssim_0',
-        'stage2_points_num_0',
         'avg_stage1_psnr',
         'avg_stage1_ssim',
-        'avg_stage2_psnr',
-        'avg_stage2_ssim',
         'checkpoint_size_kb',
         'model_artifact_size_kb',
         'entropy_bitstream_size_kb',

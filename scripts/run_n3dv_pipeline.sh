@@ -61,7 +61,7 @@ PY
 FINAL_ITER="$(python - <<PY
 import json
 c=json.load(open('${CFG}','r'))
-print(int(c.get('iterations', 400)) + int(c.get('iterations_s2', 100)))
+print(int(c.get('iterations', 400)))
 PY
 )"
 
