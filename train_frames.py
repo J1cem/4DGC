@@ -394,10 +394,11 @@ def train_one_frame(lp,op,pp,args):
 def train_frames(lp, op, pp, args):
     # Initialize system state (RNG)
     safe_state(args.quiet)
+    args.iterations_s2 = 0
     video_path=args.video_path
     output_path=args.output_path
     model_path=args.model_path
-    load_iteration = args.load_iteration
+    frame_load_iteration = args.iterations
     sub_paths = os.listdir(video_path)
     pattern = re.compile(r'colmap_(\d+)')
     frames = sorted(
@@ -407,6 +408,8 @@ def train_frames(lp, op, pp, args):
     frames=frames[args.frame_start:args.frame_end]
     if args.frame_start==1:
         args.load_iteration = args.first_load_iteration
+    else:
+        args.load_iteration = frame_load_iteration
     result1_psnr = []
     result1_ssim = []
     ckpt_sizes = []
@@ -458,7 +461,7 @@ def train_frames(lp, op, pp, args):
         print(output_str)
         print(f"Frame {frame} finished in {frame_time} seconds.")
         model_path = args.output_path
-        args.load_iteration = load_iteration
+        args.load_iteration = frame_load_iteration
         torch.cuda.empty_cache()
 
     csv_path = os.path.join(output_path, "frame_metrics.csv")
