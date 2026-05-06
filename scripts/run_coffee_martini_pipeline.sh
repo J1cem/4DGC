@@ -51,7 +51,7 @@ else
 fi
 
 FRAME_END="$(python -c "import json; c=json.load(open('${CFG}','r')); print(int(c.get('frame_end', 300)))")"
-FINAL_ITER="$(python -c "import json; c=json.load(open('${CFG}','r')); print(int(c.get('iterations', 400)) + int(c.get('iterations_s2', 100)))")"
+FINAL_ITER="$(python -c "import json; c=json.load(open('${CFG}','r')); print(int(c.get('iterations', 400)))")"
 
 RESUME_START=1
 if [ -d "${FRAME_OUT}" ]; then
