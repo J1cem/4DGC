@@ -12,6 +12,7 @@ import time
 import os
 import csv
 from pathlib import Path
+from typing import Dict, Iterable, List
 import torch
 import pickle
 from random import randint
@@ -39,7 +40,211 @@ except ImportError:
 _TB_HIST_DISABLED = False
 
 
-def compute_storage_metrics(frame_output_path, fps=30.0):
+def file_size_kb(path: Path) -> float:
+    if path.exists() and path.is_file():
+        return path.stat().st_size / 1024.0
+    return 0.0
+
+
+def dir_size_kb(path: Path) -> float:
+    if not path.exists():
+        return 0.0
+
+    total = 0.0
+    for p in path.rglob("*"):
+        if p.is_file():
+            total += p.stat().st_size / 1024.0
+    return total
+
+
+def sum_files_by_patterns(root: Path, patterns: Iterable[str]) -> float:
+    if not root.exists():
+        return 0.0
+
+    total = 0.0
+    seen = set()
+    for pattern in patterns:
+        for p in root.rglob(pattern):
+            if p.is_file() and p not in seen:
+                total += p.stat().st_size / 1024.0
+                seen.add(p)
+    return total
+
+
+def _has_files_by_patterns(root: Path, patterns: Iterable[str]) -> bool:
+    if not root.exists():
+        return False
+
+    for pattern in patterns:
+        if any(p.is_file() for p in root.rglob(pattern)):
+            return True
+    return False
+
+
+COMPRESSED_PATTERNS = {
+    "keyframe": [
+        "*keyframe*.bin",
+        "*keyframe*.npz",
+        "*keyframe*.pth",
+        "*keyframe*.pt",
+        "*init_gaussian*.bin",
+        "*initial_gaussian*.bin",
+        "*gaussian_keyframe*.bin",
+        "*compressed_gaussian*.bin",
+        "*compressed_gaussian*.npz",
+    ],
+    "motion_grid": [
+        "*motion*.bin",
+        "*motion*.npz",
+        "*motion_grid*.bin",
+        "*motion_grid*.npz",
+        "*grid*.bin",
+        "*grid*.npz",
+        "*MEM*.bin",
+        "*MEM*.npz",
+    ],
+    "compensated_gaussians": [
+        "*compensated*.bin",
+        "*compensated*.npz",
+        "*delta_gaussian*.bin",
+        "*delta_gaussian*.npz",
+        "*delta*.bin",
+        "*delta*.npz",
+        "*residual_gaussian*.bin",
+        "*residual_gaussian*.npz",
+    ],
+    "sh": [
+        "*sh*.bin",
+        "*sh*.npz",
+        "*features*.bin",
+        "*features*.npz",
+        "*feat*.bin",
+        "*feat*.npz",
+        "feature*",
+    ],
+    "entropy_model": [
+        "*entropy*.bin",
+        "*entropy*.npz",
+        "*entropy*.pt",
+        "*entropy*.pth",
+        "*pmf*.bin",
+        "*cdf*.bin",
+        "*prob*.bin",
+    ],
+    "metadata": [
+        "*.json",
+        "*.yaml",
+        "*.yml",
+        "*.pkl",
+        "*.pickle",
+        "*meta*.bin",
+        "*metadata*.bin",
+        "*header*.bin",
+        "*index*.bin",
+    ],
+    "decoder": [
+        "*decoder*.pt",
+        "*decoder*.pth",
+        "*mlp*.pt",
+        "*mlp*.pth",
+        "*network*.pt",
+        "*network*.pth",
+    ],
+}
+
+COMPRESSED_PAYLOAD_PATTERNS = [
+    "*.bin",
+    "*.npz",
+    "*.range",
+    "*.ans",
+    "*.q",
+]
+
+GLOBAL_COMPRESSED_OVERHEAD_PATTERNS = (
+    COMPRESSED_PATTERNS["entropy_model"]
+    + COMPRESSED_PATTERNS["metadata"]
+    + COMPRESSED_PATTERNS["decoder"]
+)
+
+
+def collect_compressed_representation_size(
+    frame_dir: Path,
+    is_keyframe: bool = False,
+    model_artifact_size_kb: float = 0.0,
+) -> Dict[str, float | str]:
+    """
+    Estimate the full decodable compressed representation size for one frame.
+
+    The paper-facing Size(MB/frame) should be based on this full representation,
+    not only on the entropy feature bitstreams. If no compressed payload files
+    exist yet, fall back to the saved model artifact size and mark that source.
+    """
+
+    keyframe_size_kb = (
+        sum_files_by_patterns(frame_dir, COMPRESSED_PATTERNS["keyframe"])
+        if is_keyframe else 0.0
+    )
+    motion_grid_size_kb = sum_files_by_patterns(frame_dir, COMPRESSED_PATTERNS["motion_grid"])
+    compensated_size_kb = sum_files_by_patterns(frame_dir, COMPRESSED_PATTERNS["compensated_gaussians"])
+    sh_size_kb = sum_files_by_patterns(frame_dir, COMPRESSED_PATTERNS["sh"])
+    entropy_model_size_kb = sum_files_by_patterns(frame_dir, COMPRESSED_PATTERNS["entropy_model"])
+    metadata_size_kb = sum_files_by_patterns(frame_dir, COMPRESSED_PATTERNS["metadata"])
+    decoder_size_kb = sum_files_by_patterns(frame_dir, COMPRESSED_PATTERNS["decoder"])
+
+    if is_keyframe:
+        full_size_kb = keyframe_size_kb + entropy_model_size_kb + metadata_size_kb + decoder_size_kb
+    else:
+        full_size_kb = (
+            motion_grid_size_kb
+            + compensated_size_kb
+            + sh_size_kb
+            + entropy_model_size_kb
+            + metadata_size_kb
+            + decoder_size_kb
+        )
+
+    has_compressed_payload = _has_files_by_patterns(frame_dir, COMPRESSED_PAYLOAD_PATTERNS)
+    if (not has_compressed_payload) or full_size_kb <= 0.0:
+        full_size_kb = model_artifact_size_kb
+        size_source = "model_artifact_fallback"
+    else:
+        size_source = "full_compressed_representation"
+
+    return {
+        "keyframe_representation_size_kb": keyframe_size_kb,
+        "motion_grid_bitstream_size_kb": motion_grid_size_kb,
+        "compensated_gaussians_bitstream_size_kb": compensated_size_kb,
+        "sh_bitstream_size_kb": sh_size_kb,
+        "entropy_model_size_kb": entropy_model_size_kb,
+        "metadata_size_kb": metadata_size_kb,
+        "decoder_size_kb": decoder_size_kb,
+        "full_compressed_representation_size_kb": full_size_kb,
+        "avg_full_compressed_representation_size_kb": 0.0,
+        "size_mb_per_frame": 0.0,
+        "size_source": size_source,
+    }
+
+
+def collect_global_compressed_overhead_size(output_root: Path, frame_dirs: List[Path]) -> float:
+    if not output_root.exists():
+        return 0.0
+
+    frame_dirs = [p.resolve() for p in frame_dirs]
+    total = 0.0
+    seen = set()
+    for pattern in GLOBAL_COMPRESSED_OVERHEAD_PATTERNS:
+        for p in output_root.rglob(pattern):
+            if not p.is_file() or p in seen:
+                continue
+            resolved = p.resolve()
+            if any(resolved == frame_dir or frame_dir in resolved.parents for frame_dir in frame_dirs):
+                continue
+            total += p.stat().st_size / 1024.0
+            seen.add(p)
+    return total
+
+
+def compute_storage_metrics(frame_output_path, fps=30.0, is_keyframe=False):
     frame_dir = Path(frame_output_path)
     metrics = {
         "checkpoint_size_kb": 0.0,
@@ -48,11 +253,12 @@ def compute_storage_metrics(frame_output_path, fps=30.0):
         "real_bitrate_kbps": 0.0,
     }
     if not frame_dir.exists():
+        metrics.update(collect_compressed_representation_size(frame_dir, is_keyframe=is_keyframe))
         return metrics
 
     ckpt_files = list(frame_dir.glob("chkpnt*.pth"))
     if ckpt_files:
-        metrics["checkpoint_size_kb"] = max(f.stat().st_size for f in ckpt_files) / 1024.0
+        metrics["checkpoint_size_kb"] = max(file_size_kb(f) for f in ckpt_files)
 
     point_cloud_root = frame_dir / "point_cloud"
     if point_cloud_root.exists():
@@ -63,14 +269,17 @@ def compute_storage_metrics(frame_output_path, fps=30.0):
         if iter_dirs:
             latest_iter = iter_dirs[-1]
             model_files = list(latest_iter.rglob("*.ply"))
-            metrics["model_artifact_size_kb"] = sum(f.stat().st_size for f in model_files) / 1024.0
+            metrics["model_artifact_size_kb"] = sum(file_size_kb(f) for f in model_files)
 
             bitstream_files = [f for f in latest_iter.rglob("feature*") if f.is_file()]
-            bitstream_bytes = sum(f.stat().st_size for f in bitstream_files)
-            metrics["entropy_bitstream_size_kb"] = bitstream_bytes / 1024.0
-            if fps > 0:
-                metrics["real_bitrate_kbps"] = (bitstream_bytes * 8.0 * fps) / 1000.0
+            metrics["entropy_bitstream_size_kb"] = sum(file_size_kb(f) for f in bitstream_files)
 
+    compressed_stats = collect_compressed_representation_size(
+        frame_dir=frame_dir,
+        is_keyframe=is_keyframe,
+        model_artifact_size_kb=metrics["model_artifact_size_kb"],
+    )
+    metrics.update(compressed_stats)
     return metrics
 
 class rdloss(torch.nn.Module):
@@ -124,6 +333,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    criterion = rdloss(lmbda=0.01)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -174,6 +384,35 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             )
             loss += photo_loss
             loss += 1e-5 * gaussians.mem.model.train_entropy(q=dataset.q) 
+            if bool(getattr(opt, "pcgs_stage1_enable", 1)) and opt.lambda_rd_base > 0:
+                base_f_dc = gaussians._features_dc.contiguous()
+                base_f_rest = gaussians._features_rest.contiguous()
+                base_features = torch.cat((base_f_dc, base_f_rest), dim=1)
+                base_anchor_feat = gaussians.anchor_features[gaussians.anchor_ids]
+                base_residual = base_features - base_anchor_feat
+                sampled_level = int(torch.randint(
+                    low=1,
+                    high=int(getattr(opt, "pcgs_levels", 3)) + 1,
+                    size=(1,),
+                    device=base_residual.device,
+                ).item())
+                temporal_code = float(iteration) / float(max(1, opt.iterations))
+                progressive_residual, progressive_entropy, mask_sparsity, _ = gaussians.progressive_quantize_residual(
+                    residual=base_residual,
+                    level=sampled_level,
+                    temporal_code=temporal_code,
+                )
+                attributes = progressive_residual.view(
+                    progressive_residual.shape[0],
+                    progressive_residual.shape[1],
+                    3,
+                    1,
+                ).permute(3, 1, 2, 0)
+                y_hat, y_likelihoods = gaussians.entropy_bottleneck(attributes)
+                codec_loss = criterion(y_hat, y_likelihoods, attributes)['loss']
+                loss += opt.lambda_rd_base * codec_loss
+                loss += float(getattr(opt, "pcgs_entropy_weight", 0.1)) * progressive_entropy
+                loss += 0.01 * mask_sparsity
 
         loss/=opt.batch_size
         loss.backward()
@@ -241,7 +480,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
         gaussians.limit_added_points(opt.max_added_ratio * opt.compression_ratio_s2)
         print(f"[Stage2] Added Gaussians after limit: {gaussians._added_xyz.shape[0]}")
         progress_bar = tqdm(range(opt.iterations, opt.iterations + opt.iterations_s2), desc="Training progress of Stage 2")    
-        criterion = rdloss(lmbda=0.01)
+        criterion_s2 = rdloss(lmbda=0.01)
     # Train the new Gaussians
     for iteration in range(opt.iterations + 1, opt.iterations + opt.iterations_s2 + 1):        
         iter_start.record()
@@ -291,15 +530,26 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
             features = torch.cat((f_dc, f_rest), dim=1)
 
-            # ===== Anchor residual =====
+            # ===== Progressive anchor residual =====
             anchor_feat = gaussians.anchor_features[gaussians.anchor_ids]
-
             residual = features - anchor_feat
+            sampled_level = int(torch.randint(
+                low=1,
+                high=int(getattr(opt, "pcgs_levels", 3)) + 1,
+                size=(1,),
+                device=residual.device,
+            ).item())
+            temporal_code = float(iteration - opt.iterations) / float(max(1, opt.iterations_s2))
+            progressive_residual, progressive_entropy, mask_sparsity, _ = gaussians.progressive_quantize_residual(
+                residual=residual,
+                level=sampled_level,
+                temporal_code=temporal_code,
+            )
 
             # reshape 为 entropy model 需要的格式
-            attributes = residual.view(
-                residual.shape[0],
-                residual.shape[1],
+            attributes = progressive_residual.view(
+                progressive_residual.shape[0],
+                progressive_residual.shape[1],
                 3,
                 1
             ).permute(3,1,2,0)
@@ -308,7 +558,7 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             y_hat, y_likelihoods = gaussians.entropy_bottleneck_added(attributes)
 
             # RD loss
-            codec_loss = criterion(y_hat, y_likelihoods, attributes)['loss']
+            codec_loss = criterion_s2(y_hat, y_likelihoods, attributes)['loss']
 
             # regularization for artifact reduction and compactness
             opacity_sparse = gaussians.get_opacity[-gaussians._added_xyz.shape[0]:].mean() if gaussians._added_xyz.shape[0] > 0 else torch.tensor(0.0, device=loss.device)
@@ -316,6 +566,8 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
 
             group_rigid_reg = gaussians.apply_group_rigid_motion()
             loss += opt.lambda_rd_base * codec_loss
+            loss += float(getattr(opt, "pcgs_entropy_weight", 0.1)) * progressive_entropy
+            loss += 0.01 * mask_sparsity
             loss += opt.lambda_opacity_sparse * opacity_sparse
             loss += opt.lambda_scale_reg * scale_reg
             loss += opt.lambda_group_se3 * group_rigid_reg
@@ -532,7 +784,8 @@ def train_frames(lp, op, pp, args):
     bitstream_sizes = []
     real_bitrates = []
     csv_rows = []
-    for frame in frames:
+    frame_output_dirs = []
+    for frame_idx, frame in enumerate(frames):
         start_time = time.time()
         args.source_path = os.path.join(video_path, frame)
         args.output_path = os.path.join(output_path, frame)
@@ -551,7 +804,13 @@ def train_frames(lp, op, pp, args):
         result2_ssim.append(stage2_ssim)
 
         frame_time = time.time()-start_time
-        storage_metrics = compute_storage_metrics(args.output_path, fps=float(getattr(args, "fps", 30.0)))
+        is_keyframe = frame_idx == 0
+        storage_metrics = compute_storage_metrics(
+            args.output_path,
+            fps=float(getattr(args, "fps", 30.0)),
+            is_keyframe=is_keyframe,
+        )
+        frame_output_dirs.append(Path(args.output_path))
         ckpt_sizes.append(storage_metrics["checkpoint_size_kb"])
         model_sizes.append(storage_metrics["model_artifact_size_kb"])
         bitstream_sizes.append(storage_metrics["entropy_bitstream_size_kb"])
@@ -574,6 +833,17 @@ def train_frames(lp, op, pp, args):
             'checkpoint_size_kb': float(storage_metrics['checkpoint_size_kb']),
             'model_artifact_size_kb': float(storage_metrics['model_artifact_size_kb']),
             'entropy_bitstream_size_kb': float(storage_metrics['entropy_bitstream_size_kb']),
+            'keyframe_representation_size_kb': float(storage_metrics['keyframe_representation_size_kb']),
+            'motion_grid_bitstream_size_kb': float(storage_metrics['motion_grid_bitstream_size_kb']),
+            'compensated_gaussians_bitstream_size_kb': float(storage_metrics['compensated_gaussians_bitstream_size_kb']),
+            'sh_bitstream_size_kb': float(storage_metrics['sh_bitstream_size_kb']),
+            'entropy_model_size_kb': float(storage_metrics['entropy_model_size_kb']),
+            'metadata_size_kb': float(storage_metrics['metadata_size_kb']),
+            'decoder_size_kb': float(storage_metrics['decoder_size_kb']),
+            'full_compressed_representation_size_kb': float(storage_metrics['full_compressed_representation_size_kb']),
+            'avg_full_compressed_representation_size_kb': float(storage_metrics['avg_full_compressed_representation_size_kb']),
+            'size_mb_per_frame': float(storage_metrics['size_mb_per_frame']),
+            'size_source': storage_metrics['size_source'],
             'real_bitrate_kbps': float(storage_metrics['real_bitrate_kbps']),
             'avg_checkpoint_size_kb': float(sum(ckpt_sizes)/len(ckpt_sizes)),
             'avg_model_artifact_size_kb': float(sum(model_sizes)/len(model_sizes)),
@@ -591,6 +861,44 @@ def train_frames(lp, op, pp, args):
         model_path = args.output_path
         args.load_iteration = load_iteration
         torch.cuda.empty_cache()
+
+    num_frames = len(csv_rows)
+    global_compressed_overhead_kb = collect_global_compressed_overhead_size(
+        Path(output_path),
+        frame_output_dirs,
+    )
+    total_full_compressed_size_kb = (
+        sum(row["full_compressed_representation_size_kb"] for row in csv_rows)
+        + global_compressed_overhead_kb
+    )
+    avg_full_compressed_representation_size_kb = (
+        total_full_compressed_size_kb / num_frames if num_frames > 0 else 0.0
+    )
+    size_mb_per_frame = avg_full_compressed_representation_size_kb / 1024.0
+    final_real_bitrate_kbps = (
+        avg_full_compressed_representation_size_kb * 8.0 * float(getattr(args, "fps", 30.0))
+        if num_frames > 0 else 0.0
+    )
+
+    for row in csv_rows:
+        row["avg_full_compressed_representation_size_kb"] = float(avg_full_compressed_representation_size_kb)
+        row["size_mb_per_frame"] = float(size_mb_per_frame)
+        row["real_bitrate_kbps"] = float(final_real_bitrate_kbps)
+        row["avg_real_bitrate_kbps"] = float(final_real_bitrate_kbps)
+
+    summary_metrics = {
+        "final_size_mb_per_frame": float(size_mb_per_frame),
+        "final_size_kb_per_frame": float(avg_full_compressed_representation_size_kb),
+        "total_full_compressed_size_kb": float(total_full_compressed_size_kb),
+        "global_compressed_overhead_kb": float(global_compressed_overhead_kb),
+        "num_frames": int(num_frames),
+        "final_real_bitrate_kbps": float(final_real_bitrate_kbps),
+    }
+    summary_path = os.path.join(output_path, "frame_metrics_summary.json")
+    os.makedirs(output_path, exist_ok=True)
+    with open(summary_path, "w") as summary_file:
+        json.dump(summary_metrics, summary_file, indent=2)
+    print(f"Saved frame metrics summary to: {summary_path}")
 
     csv_path = os.path.join(output_path, "frame_metrics.csv")
     fieldnames = [
@@ -611,6 +919,17 @@ def train_frames(lp, op, pp, args):
         'checkpoint_size_kb',
         'model_artifact_size_kb',
         'entropy_bitstream_size_kb',
+        'keyframe_representation_size_kb',
+        'motion_grid_bitstream_size_kb',
+        'compensated_gaussians_bitstream_size_kb',
+        'sh_bitstream_size_kb',
+        'entropy_model_size_kb',
+        'metadata_size_kb',
+        'decoder_size_kb',
+        'full_compressed_representation_size_kb',
+        'avg_full_compressed_representation_size_kb',
+        'size_mb_per_frame',
+        'size_source',
         'real_bitrate_kbps',
         'avg_checkpoint_size_kb',
         'avg_model_artifact_size_kb',
